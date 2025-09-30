@@ -477,6 +477,12 @@ int main(int argc, char** argv) {
               "       packets may expire before pops occur. Consider --win-us>=%" PRIu64 "\n",
               win_us, interval * 1e6, min_us);
     }
+    if (summary_period * 1e6 > (double)win_us) {
+      fprintf(stderr,
+              "[warn] summary window (%.0f us) exceeds capture window (%u us);\n"
+              "       moved egress pop to each poll, but consider increasing --win-us.\n",
+              summary_period * 1e6, win_us);
+    }
   }
 
   uint64_t dedup_tot_pkts[64] = {0};
@@ -529,6 +535,7 @@ int main(int argc, char** argv) {
   }
 
   static uint64_t last_stream_drop_pkts[256] = {0};
+  static uint64_t last_dedup_pkts_poll[64] = {0};
   while (g_running) {
     sleep_interval(interval);
 
@@ -555,6 +562,21 @@ int main(int argc, char** argv) {
       if (popn) {
         size_t did = q_pop_n(&C.q, popn);
         C.pop_total += did;
+      }
+
+      // Also pop on every poll using per-port dedup drop delta on the configured egress_port
+      if (C.egress_port >= 0 && C.egress_port < (int)port_res->numPorts) {
+        const struct NtPortStatistics_v3_s* rx = &port_res->aPorts[C.egress_port].rx;
+        if (rx->valid.extDrop) {
+          uint64_t curp = rx->extDrop.pktsDedup;
+          uint64_t prevp = last_dedup_pkts_poll[C.egress_port];
+          size_t popp = (size_t)((curp >= prevp) ? (curp - prevp) : curp);
+          last_dedup_pkts_poll[C.egress_port] = curp;
+          if (popp) {
+            size_t did2 = q_pop_n(&C.q, popp);
+            C.pop_total += did2;
+          }
+        }
       }
     }
 

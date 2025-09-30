@@ -1,0 +1,16 @@
+# Ignore everything by default
+*
+# Allow directories so rules below apply recursively
+!**/
+# Ignore hidden files and directories everywhere
+.*
+**/.*
+# Keep this ignore file
+!.gitignore
+# Track C, Python, and JSON sources anywhere
+!*.c
+!*.py
+!*.json
+!**/*.c
+!**/*.py
+!**/*.json
