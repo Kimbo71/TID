@@ -60,6 +60,11 @@ typedef struct {
   const char* path1;
   double interval;
   size_t max_pairs;   // 0 = all available
+  // report options
+  const char* report_path;
+  size_t report_limit;   // number of mismatches to include
+  size_t report_bytes;   // bytes of each side to hex-dump
+
   size_t last_pairs;
   uint64_t total_diffs;
   uint64_t last_diffs;
@@ -67,6 +72,14 @@ typedef struct {
   off_t size0, size1;
   digest_vec_t v0, v1;
 } compare_ctx_t;
+
+typedef struct {
+  size_t* a; size_t used; size_t cap;
+} index_vec_t;
+static void iv_init(index_vec_t* v){ v->a=NULL; v->used=0; v->cap=0; }
+static void iv_push(index_vec_t* v, size_t x){ if (v->used==v->cap){ size_t nc=v->cap?v->cap*2:32; v->a=(size_t*)realloc(v->a,nc*sizeof(size_t)); if(!v->a){perror("realloc"); exit(1);} v->cap=nc;} v->a[v->used++]=x; }
+static void iv_reset(index_vec_t* v){ v->used=0; }
+static void iv_free(index_vec_t* v){ free(v->a); iv_init(v);} 
 
 static int file_stat(const char* p, time_t* mt, off_t* sz){
   struct stat st; if (!p || stat(p, &st)!=0) return -1; if (mt) *mt = st.st_mtime; if (sz) *sz = st.st_size; return 0;
@@ -93,9 +106,42 @@ static void print_two(const char* label, uint64_t a, uint64_t b){
 }
 static void print_one(const char* label, uint64_t v){ printf("%-18s | #%018" PRIu64 " |\n", label, v); }
 
+static void hexdump_line(FILE* f, const uint8_t* p, size_t n){
+  for (size_t i=0;i<n;i++){ fprintf(f, "%02x%s", p[i], ((i&15)==15||i==n-1)?"":" "); }
+}
+
+static int dump_nth(const char* path, size_t idx, size_t max_bytes, FILE* f){
+  char errbuf[PCAP_ERRBUF_SIZE]; pcap_t* p = pcap_open_offline(path, errbuf); if(!p) return -1;
+  const u_char* data; struct pcap_pkthdr* hdr; int rc; size_t i=0; int found=0;
+  while ((rc = pcap_next_ex(p, &hdr, &data)) == 1){ if (i==idx){ found=1; break; } i++; }
+  if (!found){ pcap_close(p); return -1; }
+  size_t n = hdr->caplen < max_bytes ? hdr->caplen : max_bytes;
+  fprintf(f, "len=%u cap=%u dump=%zu bytes\n", (unsigned)hdr->len, (unsigned)hdr->caplen, n);
+  hexdump_line(f, (const uint8_t*)data, n); fputc('\n', f);
+  pcap_close(p); return 0;
+}
+
+static void write_report(compare_ctx_t* C, const index_vec_t* mis){
+  if (!C->report_path || mis->used==0) return;
+  char tmp[512]; snprintf(tmp, sizeof tmp, "%s.tmp", C->report_path);
+  FILE* f = fopen(tmp, "w"); if(!f) return;
+  time_t now = time(NULL); char ts[64]; struct tm tm; localtime_r(&now,&tm); strftime(ts,sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
+  fprintf(f, "Traffic PCAP Compare Report\nGenerated: %s\nFiles:\n  pcap0: %s\n  pcap1: %s\nPairs compared: %zu\nDifferences: %" PRIu64 "\nEntries: %zu (limit %zu)\n\n",
+          ts, C->path0, C->path1, C->last_pairs, C->total_diffs, mis->used, C->report_limit);
+  for (size_t k=0;k<mis->used;k++){
+    size_t i = mis->a[k];
+    fprintf(f, "#%zu\n", i);
+    fprintf(f, "pcap0: "); (void)dump_nth(C->path0, i, C->report_bytes, f);
+    fprintf(f, "pcap1: "); (void)dump_nth(C->path1, i, C->report_bytes, f);
+    fputc('\n', f);
+  }
+  fclose(f); rename(tmp, C->report_path);
+}
+
 int main(int argc, char** argv){
   const char* p0 = NULL, *p1 = NULL; 
   double interval = 0.5; int once = 0; size_t max_pairs = 0; int verbose_first = 0;
+  const char* report_path = NULL; size_t report_limit = 20; size_t report_bytes = 64;
   static struct option opts[] = {
     {"pcap0", required_argument, NULL, 1001},
     {"pcap1", required_argument, NULL, 1002},
@@ -103,6 +149,9 @@ int main(int argc, char** argv){
     {"once", no_argument, NULL, 'o'},
     {"max-pairs", required_argument, NULL, 1003},
     {"print-first-diff", no_argument, NULL, 1004},
+    {"report", required_argument, NULL, 1005},
+    {"report-limit", required_argument, NULL, 1006},
+    {"report-bytes", required_argument, NULL, 1007},
     {NULL,0,NULL,0}
   };
   int c; while ((c = getopt_long(argc, argv, "i:o", opts, NULL)) != -1){
@@ -113,8 +162,12 @@ int main(int argc, char** argv){
       case 'o': once = 1; break;
       case 1003: max_pairs = (size_t)atol(optarg); break;
       case 1004: verbose_first = 1; break;
+      case 1005: report_path = optarg; break;
+      case 1006: report_limit = (size_t)atol(optarg); break;
+      case 1007: report_bytes = (size_t)atol(optarg); if (report_bytes==0) report_bytes=1; break;
       default:
-        fprintf(stderr, "Usage: %s --pcap0=PATH --pcap1=PATH [--interval=SEC] [--once] [--max-pairs=N] [--print-first-diff]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --pcap0=PATH --pcap1=PATH [--interval=SEC] [--once] [--max-pairs=N] [--print-first-diff]\n"
+                        "            [--report=PATH] [--report-limit=N] [--report-bytes=B]\n", argv[0]);
         return 1;
     }
   }
@@ -125,7 +178,9 @@ int main(int argc, char** argv){
   signal(SIGINT, on_sigint);
 
   compare_ctx_t C = {0}; C.path0 = p0; C.path1 = p1; C.interval = interval; C.max_pairs = max_pairs;
+  C.report_path = report_path; C.report_limit = report_limit; C.report_bytes = report_bytes;
   dv_init(&C.v0); dv_init(&C.v1);
+  index_vec_t mis; iv_init(&mis);
 
   while (g_running){
     sleep_interval(C.interval);
@@ -138,9 +193,11 @@ int main(int argc, char** argv){
     size_t pairs = n0 < n1 ? n0 : n1;
     if (C.max_pairs && pairs > C.max_pairs) pairs = C.max_pairs;
 
-    uint64_t diffs = 0; size_t first_i = (size_t)-1;
+    uint64_t diffs = 0; size_t first_i = (size_t)-1; iv_reset(&mis);
     for (size_t i=0;i<pairs;i++){
-      if (C.v0.lens[i] != C.v1.lens[i] || C.v0.digests[i] != C.v1.digests[i]){ diffs++; if (first_i==(size_t)-1) first_i=i; }
+      if (C.v0.lens[i] != C.v1.lens[i] || C.v0.digests[i] != C.v1.digests[i]){
+        diffs++; if (first_i==(size_t)-1) first_i=i; if (mis.used < C.report_limit) iv_push(&mis, i);
+      }
     }
     uint64_t delta = (diffs >= C.last_diffs) ? (diffs - C.last_diffs) : diffs;
     C.total_diffs = diffs; C.last_diffs = diffs; C.last_pairs = pairs;
@@ -155,11 +212,16 @@ int main(int argc, char** argv){
     print_one("Differences", diffs);
     if (verbose_first && first_i != (size_t)-1){ printf("First diff at index: %zu\n", first_i); }
 
+    if (C.report_path && diffs>0){
+      printf("Report: writing first %zu diffs to %s (bytes=%zu)\n", mis.used, C.report_path, C.report_bytes);
+      write_report(&C, &mis);
+    }
+
     printf("\nStatus: comparing every %.2fs. Ctrl+C to exit\n", C.interval);
     (void)delta;
     if (once) break;
   }
 
-  dv_free(&C.v0); dv_free(&C.v1);
+  dv_free(&C.v0); dv_free(&C.v1); iv_free(&mis);
   return 0;
 }
