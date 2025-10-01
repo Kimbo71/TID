@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
   int adapter = 0;
   double interval = 0.5;
   /* summary window removed in this simplified tool */
-  int color_bit = 7;
+  /* color bit removed from simplified UI */
   int once = 0;
 
   // Sampling options
@@ -78,7 +78,6 @@ int main(int argc, char** argv) {
   static struct option long_opts[] = {
     {"adapter",   required_argument, NULL, 'a'},
     {"interval",  required_argument, NULL, 'i'},
-    {"color-bit", required_argument, NULL, 'b'},
     {"once",      no_argument,       NULL, 'o'},
     {"pcap0",     required_argument, NULL, 1001},
     {"pcap1",     required_argument, NULL, 1002},
@@ -91,11 +90,10 @@ int main(int argc, char** argv) {
     {NULL, 0, NULL, 0}
   };
   int opt;
-  while ((opt = getopt_long(argc, argv, "a:i:b:o", long_opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "a:i:o", long_opts, NULL)) != -1) {
     switch (opt) {
       case 'a': adapter = atoi(optarg); break;
       case 'i': interval = atof(optarg); if (interval <= 0.0) interval = 0.5; break;
-      case 'b': color_bit = atoi(optarg); if (color_bit < 0) color_bit = 0; if (color_bit > 63) color_bit = 63; break;
       case 'o': once = 1; break;
       case 1001: pcap0_path = optarg; break;
       case 1002: pcap1_path = optarg; break;
@@ -106,7 +104,7 @@ int main(int argc, char** argv) {
       case 1007: port0_index = atoi(optarg); break;
       case 1008: port1_index = atoi(optarg); break;
       default:
-        fprintf(stderr, "Usage: %s [--adapter=N] [--interval=SEC] [--color-bit=N] [--once]\n"
+        fprintf(stderr, "Usage: %s [--adapter=N] [--interval=SEC] [--once]\n"
                         "            [--pcap0=PATH] [--pcap1=PATH] [--snaplen=B] [--sample-count=N] [--sample-seconds=S]\n"
                         "            [--rx-stream-id=N] [--port0=N] [--port1=N] (defaults: port0=0, port1=1)\n", argv[0]);
         return EXIT_FAILURE;
@@ -234,7 +232,7 @@ int main(int argc, char** argv) {
     clear_screen();
     char ts[64];
     printf("Traffic Impact Monitor            %s\n\n", now_str(ts, sizeof ts));
-    printf("Adapter %d  Interval %.1fs  Color bit %d\n\n", adapter, interval, color_bit);
+    printf("Adapter %d  Interval %.1fs\n\n", adapter, interval);
 
     // Stage-1 interface per tid-reqs-stage1.pdf
     // Stage-2 header: remove leading port indices in column labels
