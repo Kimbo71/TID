@@ -140,7 +140,8 @@ int main(int argc, char** argv) {
     printf("Adapter %d  Interval %.1fs  Summary %.1fs  Color bit %d\n\n", adapter, interval, summary_period, color_bit);
 
     // Stage-1 interface per tid-reqs-stage1.pdf
-    printf("%-18s | %-22s | %-22s\n", "Metric", "Port 0 Ingress Port 1 TAP", "Port 1 Egress Port 2 TAP");
+    // Stage-2 header: remove leading port indices in column labels
+    printf("%-18s | %-22s | %-22s\n", "Metric", "Ingress Port 1 TAP", "Egress Port 2 TAP");
     printf("------------------+----------------------+----------------------\n");
     print_bw_row("RX Speed", gbps0, gbps1);
     print_side_row("Packets", v0_pkts, v1_pkts);
@@ -148,9 +149,9 @@ int main(int argc, char** argv) {
     // Derived rows per Stage-2: explicitly show both equal and not-equal counts
     // Port 1 = Port 2 is the dedup packet counter on Port 1
     print_single_row("Port 1 = Port 2", d1_pkts);
-    // Port 1 != Port 2 is Port0 packets minus dedup pkts
+    // Port 1 != Port 2 is Port0 packets minus dedup pkts; render single-value row (second column removed)
     uint64_t forwarded_est = (v0_pkts >= d1_pkts) ? (v0_pkts - d1_pkts) : 0;
-    print_side_row("Port 1 != Port 2", forwarded_est, 0);
+    print_single_row("Port 1 != Port 2", forwarded_est);
 
     // Extended counters subset
     if (p0 || p1) {
@@ -164,22 +165,7 @@ int main(int argc, char** argv) {
       print_side_row("1024-1518 octets", p0 ? p0->RMON1.pkts1024to1518Octets : 0, p1 ? p1->RMON1.pkts1024to1518Octets : 0);
     }
 
-    printf("\nDrop counters\n");
-    print_side_row("Dedup pkts", (p0 && p0->valid.extDrop) ? p0->extDrop.pktsDedup : 0,
-                            (p1 && p1->valid.extDrop) ? p1->extDrop.pktsDedup : 0);
-
-    printf("\nDedup summary (last %.0fs window)\n", summary_period);
-    printf("Port | total_pkts           delta_pkts           total_octets         delta_octets\n");
-    for (uint8_t p = 0; p < port_res->numPorts && p < 64; ++p) {
-      printf("%4u | #%018" PRIu64 "  #%018" PRIu64 "  #%018" PRIu64 "  #%018" PRIu64 "\n",
-             p, dedup_tot_pkts[p], dedup_delta_pkts[p], dedup_tot_octets[p], dedup_delta_octets[p]);
-    }
-
-    if (adapter < adapter_res->numAdapters && adapter_res->aAdapters[adapter].color.supported) {
-      const struct NtColorStatistics_s* col = &adapter_res->aAdapters[adapter].color.aColor[color_bit];
-      printf("\nAdapter color bit %d totals: pkts=%" PRIu64 " octets=%" PRIu64 "\n",
-             color_bit, col->pkts, col->octets);
-    }
+    // Stage-2 removes Drop counters, Dedup summary table, and adapter color totals
 
     printf("\nPress Ctrl+C to exit\n");
     if (once) break;
