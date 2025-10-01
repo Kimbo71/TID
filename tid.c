@@ -8,9 +8,15 @@
 #include <unistd.h>
 #include <signal.h>
 #include <getopt.h>
+#include <pthread.h>
 
 #include <nt.h>
 #include <ntapi/stream_statistics.h>
+// Optional packet sampling support
+#include <ntapi/pktdescr.h>
+#include <ntapi/pktdescr_dyn3.h>
+#include <ntapi/pktdescr_dyn4.h>
+#include <pcap/pcap.h>
 
 static volatile sig_atomic_t g_running = 1;
 static void on_sigint(int sig) { (void)sig; g_running = 0; }
@@ -59,12 +65,30 @@ int main(int argc, char** argv) {
   int color_bit = 7;
   int once = 0;
 
+  // Sampling options
+  const char* pcap0_path = NULL;
+  const char* pcap1_path = NULL;
+  uint32_t snaplen = 128;
+  uint32_t sample_count = 256;    // per port target
+  double sample_seconds = 0.0;    // 0 = disabled
+  int rx_stream_id = -1;          // capture stream id (any)
+  int port0_index = 0;            // match rxPort for port 0 samples
+  int port1_index = 1;            // match rxPort for port 1 samples
+
   static struct option long_opts[] = {
     {"adapter",   required_argument, NULL, 'a'},
     {"interval",  required_argument, NULL, 'i'},
     {"summary",   required_argument, NULL, 's'},
     {"color-bit", required_argument, NULL, 'b'},
     {"once",      no_argument,       NULL, 'o'},
+    {"pcap0",     required_argument, NULL, 1001},
+    {"pcap1",     required_argument, NULL, 1002},
+    {"snaplen",   required_argument, NULL, 1003},
+    {"sample-count", required_argument, NULL, 1004},
+    {"sample-seconds", required_argument, NULL, 1005},
+    {"rx-stream-id", required_argument, NULL, 1006},
+    {"port0",     required_argument, NULL, 1007},
+    {"port1",     required_argument, NULL, 1008},
     {NULL, 0, NULL, 0}
   };
   int opt;
@@ -75,8 +99,18 @@ int main(int argc, char** argv) {
       case 's': summary_period = atof(optarg); if (summary_period <= 0.0) summary_period = 2.0; break;
       case 'b': color_bit = atoi(optarg); if (color_bit < 0) color_bit = 0; if (color_bit > 63) color_bit = 63; break;
       case 'o': once = 1; break;
+      case 1001: pcap0_path = optarg; break;
+      case 1002: pcap1_path = optarg; break;
+      case 1003: snaplen = (uint32_t)atoi(optarg); if (snaplen < 64) snaplen = 64; break;
+      case 1004: sample_count = (uint32_t)atoi(optarg); if ((int)sample_count < 0) sample_count = 0; break;
+      case 1005: sample_seconds = atof(optarg); if (sample_seconds < 0.0) sample_seconds = 0.0; break;
+      case 1006: rx_stream_id = atoi(optarg); break;
+      case 1007: port0_index = atoi(optarg); break;
+      case 1008: port1_index = atoi(optarg); break;
       default:
-        fprintf(stderr, "Usage: %s [--adapter=N] [--interval=SEC] [--summary=SEC] [--color-bit=N] [--once]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--adapter=N] [--interval=SEC] [--summary=SEC] [--color-bit=N] [--once]\n"
+                        "            [--pcap0=PATH] [--pcap1=PATH] [--snaplen=B] [--sample-count=N] [--sample-seconds=S]\n"
+                        "            [--rx-stream-id=N] [--port0=N] [--port1=N]\n", argv[0]);
         return EXIT_FAILURE;
     }
   }
@@ -90,6 +124,85 @@ int main(int argc, char** argv) {
 
   signal(SIGINT, on_sigint);
   setvbuf(stdout, NULL, _IONBF, 0);
+
+  // Optional PCAP sampling context
+  typedef struct {
+    volatile sig_atomic_t running;
+    NtNetStreamRx_t rx;
+    pcap_t* p_dead;
+    pcap_dumper_t* d0;
+    pcap_dumper_t* d1;
+    const char* path0;
+    const char* path1;
+    uint32_t snaplen;
+    uint32_t target;
+    uint32_t wrote0;
+    uint32_t wrote1;
+    int port0;
+    int port1;
+    double max_sec;
+    struct timespec t0;
+  } sample_ctx_t;
+
+  sample_ctx_t SC = {0};
+  pthread_t cap_thread;
+
+  int sampling_enabled = (pcap0_path || pcap1_path) ? 1 : 0;
+  if (sampling_enabled) {
+    SC.running = 1; SC.snaplen = snaplen; SC.target = sample_count; SC.max_sec = sample_seconds;
+    SC.path0 = pcap0_path; SC.path1 = pcap1_path; SC.port0 = port0_index; SC.port1 = port1_index;
+    clock_gettime(CLOCK_REALTIME, &SC.t0);
+    SC.p_dead = pcap_open_dead(DLT_EN10MB, SC.snaplen);
+    if (!SC.p_dead) { fprintf(stderr, "pcap_open_dead failed\n"); sampling_enabled = 0; }
+    if (sampling_enabled && SC.path0) { SC.d0 = pcap_dump_open(SC.p_dead, SC.path0); if (!SC.d0) { fprintf(stderr, "pcap_dump_open %s: %s\n", SC.path0, pcap_geterr(SC.p_dead)); } }
+    if (sampling_enabled && SC.path1) { SC.d1 = pcap_dump_open(SC.p_dead, SC.path1); if (!SC.d1) { fprintf(stderr, "pcap_dump_open %s: %s\n", SC.path1, pcap_geterr(SC.p_dead)); } }
+    // Open a capture RX stream
+    if (sampling_enabled) {
+      int rc = NT_NetRxOpen(&SC.rx, "tid_cap", NT_NET_INTERFACE_PACKET, adapter, rx_stream_id);
+      if (rc != NT_SUCCESS) { die_nt("NT_NetRxOpen", rc); }
+    }
+    // Thread to pull and write samples
+    if (sampling_enabled) {
+      auto void* cap_fn(void* arg) {
+        sample_ctx_t* C = (sample_ctx_t*)arg;
+        while (C->running) {
+          NtNetBuf_t nb = NULL; int st = NT_NetRxGet(C->rx, &nb, 1000);
+          if (st==NT_STATUS_TIMEOUT || st==NT_STATUS_TRYAGAIN) {
+            // check time limit
+            if (C->max_sec > 0.0) {
+              struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+              double dt = (now.tv_sec - C->t0.tv_sec) + (now.tv_nsec - C->t0.tv_nsec)/1e9;
+              if (dt >= C->max_sec) C->running = 0;
+            }
+            continue;
+          }
+          if (st!=NT_SUCCESS) continue;
+          unsigned dtp = NT_NET_GET_PKT_DESCRIPTOR_TYPE(nb);
+          uint8_t* l2 = (uint8_t*)NT_NET_GET_PKT_L2_PTR(nb);
+          uint32_t cap = NT_NET_GET_PKT_CAP_LENGTH(nb);
+          uint32_t wire= NT_NET_GET_PKT_WIRE_LENGTH(nb);
+          uint8_t rxp = 255;
+          if (dtp == 4)      rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb)->rxPort;
+          else if (dtp == 3 || dtp == NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC)
+                              rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb)->rxPort;
+          // timestamp: host realtime for PCAP
+          struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+          struct pcap_pkthdr h; memset(&h, 0, sizeof h);
+          h.caplen = cap < C->snaplen ? cap : C->snaplen; h.len = wire ? wire : h.caplen;
+          h.ts.tv_sec = ts.tv_sec; h.ts.tv_usec = (suseconds_t)(ts.tv_nsec/1000);
+          if (C->d0 && rxp == (uint8_t)C->port0 && C->wrote0 < C->target) { pcap_dump((u_char*)C->d0, &h, l2); C->wrote0++; }
+          if (C->d1 && rxp == (uint8_t)C->port1 && C->wrote1 < C->target) { pcap_dump((u_char*)C->d1, &h, l2); C->wrote1++; }
+          NT_NetRxRelease(C->rx, nb);
+          if ((C->path0?C->wrote0>=C->target:1) && (C->path1?C->wrote1>=C->target:1)) {
+            if (C->max_sec <= 0.0) C->running = 0; // stop when reached targets (unless a time window specified)
+          }
+        }
+        return (void*)0;
+      }
+      ;
+      pthread_create(&cap_thread, NULL, cap_fn, &SC);
+    }
+  }
 
   double since_summary = summary_period;
   uint64_t prev_octets[64] = {0};
@@ -154,11 +267,25 @@ int main(int argc, char** argv) {
 
     // Stage-2 removes Drop counters, Dedup summary table, and adapter color totals
 
+    if (sampling_enabled) {
+      printf("\nPCAP sample: p0=%u/%u p1=%u/%u  %s%s%s\n",
+             SC.wrote0, SC.path0?SC.target:0, SC.wrote1, SC.path1?SC.target:0,
+             SC.path0?"pcap0=":"", SC.path0?SC.path0:"", (SC.path0 && SC.path1)?" ":"");
+      if (SC.path1) printf("pcap1=%s\n", SC.path1);
+    }
+
     printf("\nPress Ctrl+C to exit\n");
     if (once) break;
   }
 
   NT_StatClose(stat_stream);
+  if (sampling_enabled) {
+    SC.running = 0;
+    if (SC.rx) NT_NetRxClose(SC.rx);
+    if (SC.d0) { pcap_dump_close(SC.d0); }
+    if (SC.d1) { pcap_dump_close(SC.d1); }
+    if (SC.p_dead) { pcap_close(SC.p_dead); }
+  }
   NT_Done();
   return 0;
 }
