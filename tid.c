@@ -25,7 +25,8 @@ static void die_nt(const char* where, int status) {
 static void sleep_interval(double seconds) {
   if (seconds <= 0.0) return;
   struct timespec ts; ts.tv_sec = (time_t)seconds; ts.tv_nsec = (long)((seconds - ts.tv_sec) * 1e9);
-  if (ts.tv_nsec < 0) ts.tv_nsec = 0; nanosleep(&ts, NULL);
+  if (ts.tv_nsec < 0) ts.tv_nsec = 0;
+  nanosleep(&ts, NULL);
 }
 
 static void clear_screen(void) { fputs("\033[2J\033[H", stdout); }
@@ -92,10 +93,6 @@ int main(int argc, char** argv) {
 
   double since_summary = summary_period;
   uint64_t prev_octets[64] = {0};
-  uint64_t dedup_tot_pkts[64] = {0};
-  uint64_t dedup_tot_octets[64] = {0};
-  uint64_t dedup_delta_pkts[64] = {0};
-  uint64_t dedup_delta_octets[64] = {0};
 
   while (g_running) {
     sleep_interval(interval);
@@ -106,7 +103,7 @@ int main(int argc, char** argv) {
     if (status != NT_SUCCESS) die_nt("NT_StatRead", status);
 
     const struct NtStatisticsQueryPortResult_v4_s* port_res = &stat.u.query_v4.data.port;
-    const struct NtStatisticsQueryAdapterResult_v4_s* adapter_res = &stat.u.query_v4.data.adapter;
+    // Adapter scope not used in Stage-3 interface
 
     const struct NtPortStatistics_v3_s* p0 = port_res->numPorts > 0 ? &port_res->aPorts[0].rx : NULL;
     const struct NtPortStatistics_v3_s* p1 = port_res->numPorts > 1 ? &port_res->aPorts[1].rx : NULL;
@@ -120,19 +117,7 @@ int main(int argc, char** argv) {
     if (p1) { gbps1 = (double)(p1->RMON1.octets - prev_octets[1]) * 8.0 / interval; prev_octets[1] = p1->RMON1.octets; }
 
     since_summary += interval;
-    if (since_summary >= summary_period) {
-      for (uint8_t p = 0; p < port_res->numPorts && p < 64; ++p) {
-        const struct NtPortStatistics_v3_s* rx = &port_res->aPorts[p].rx;
-        if (rx->valid.extDrop) {
-          uint64_t pkts = rx->extDrop.pktsDedup;
-          uint64_t octs = rx->extDrop.octetsDedup;
-          dedup_delta_pkts[p] = pkts >= dedup_tot_pkts[p] ? pkts - dedup_tot_pkts[p] : pkts;
-          dedup_delta_octets[p] = octs >= dedup_tot_octets[p] ? octs - dedup_tot_octets[p] : octs;
-          dedup_tot_pkts[p] = pkts; dedup_tot_octets[p] = octs;
-        }
-      }
-      since_summary = 0.0;
-    }
+    if (since_summary >= summary_period) { since_summary = 0.0; }
 
     clear_screen();
     char ts[64];
@@ -153,7 +138,9 @@ int main(int argc, char** argv) {
     uint64_t forwarded_est = (v0_pkts >= d1_pkts) ? (v0_pkts - d1_pkts) : 0;
     print_single_row("Port 1 != Port 2", forwarded_est);
 
-    // Extended counters subset
+    // Extended Counters
+    printf("\nExtended Counters\n\n");
+    printf("------------------+----------------------+----------------------\n");
     if (p0 || p1) {
       const struct NtExtendedRMONCounters_v1_s* e0 = p0 && p0->valid.extRMON ? &p0->extRMON : NULL;
       const struct NtExtendedRMONCounters_v1_s* e1 = p1 && p1->valid.extRMON ? &p1->extRMON : NULL;
