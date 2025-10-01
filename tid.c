@@ -61,7 +61,7 @@ static void print_single_row(const char* label, uint64_t v){
 int main(int argc, char** argv) {
   int adapter = 0;
   double interval = 0.5;
-  double summary_period = 2.0;
+  /* summary window removed in this simplified tool */
   int color_bit = 7;
   int once = 0;
 
@@ -72,13 +72,12 @@ int main(int argc, char** argv) {
   uint32_t sample_count = 256;    // per port target
   double sample_seconds = 0.0;    // 0 = disabled
   int rx_stream_id = -1;          // capture stream id (any)
-  int port0_index = 0;            // match rxPort for port 0 samples
-  int port1_index = 1;            // match rxPort for port 1 samples
+  int port0_index = 0;            // match rxPort for Port 0 (default 0)
+  int port1_index = 1;            // match rxPort for Port 1 (default 1)
 
   static struct option long_opts[] = {
     {"adapter",   required_argument, NULL, 'a'},
     {"interval",  required_argument, NULL, 'i'},
-    {"summary",   required_argument, NULL, 's'},
     {"color-bit", required_argument, NULL, 'b'},
     {"once",      no_argument,       NULL, 'o'},
     {"pcap0",     required_argument, NULL, 1001},
@@ -92,11 +91,10 @@ int main(int argc, char** argv) {
     {NULL, 0, NULL, 0}
   };
   int opt;
-  while ((opt = getopt_long(argc, argv, "a:i:s:b:o", long_opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "a:i:b:o", long_opts, NULL)) != -1) {
     switch (opt) {
       case 'a': adapter = atoi(optarg); break;
       case 'i': interval = atof(optarg); if (interval <= 0.0) interval = 0.5; break;
-      case 's': summary_period = atof(optarg); if (summary_period <= 0.0) summary_period = 2.0; break;
       case 'b': color_bit = atoi(optarg); if (color_bit < 0) color_bit = 0; if (color_bit > 63) color_bit = 63; break;
       case 'o': once = 1; break;
       case 1001: pcap0_path = optarg; break;
@@ -108,9 +106,9 @@ int main(int argc, char** argv) {
       case 1007: port0_index = atoi(optarg); break;
       case 1008: port1_index = atoi(optarg); break;
       default:
-        fprintf(stderr, "Usage: %s [--adapter=N] [--interval=SEC] [--summary=SEC] [--color-bit=N] [--once]\n"
+        fprintf(stderr, "Usage: %s [--adapter=N] [--interval=SEC] [--color-bit=N] [--once]\n"
                         "            [--pcap0=PATH] [--pcap1=PATH] [--snaplen=B] [--sample-count=N] [--sample-seconds=S]\n"
-                        "            [--rx-stream-id=N] [--port0=N] [--port1=N]\n", argv[0]);
+                        "            [--rx-stream-id=N] [--port0=N] [--port1=N] (defaults: port0=0, port1=1)\n", argv[0]);
         return EXIT_FAILURE;
     }
   }
@@ -142,6 +140,7 @@ int main(int argc, char** argv) {
     int port1;
     double max_sec;
     struct timespec t0;
+    uint64_t port_seen[256];
   } sample_ctx_t;
 
   sample_ctx_t SC = {0};
@@ -185,6 +184,7 @@ int main(int argc, char** argv) {
           if (dtp == 4)      rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb)->rxPort;
           else if (dtp == 3 || dtp == NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC)
                               rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb)->rxPort;
+          C->port_seen[rxp]++;
           // timestamp: host realtime for PCAP
           struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
           struct pcap_pkthdr h; memset(&h, 0, sizeof h);
@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  double since_summary = summary_period;
+  /* no summary window */
   uint64_t prev_octets[64] = {0};
 
   while (g_running) {
@@ -226,16 +226,15 @@ int main(int argc, char** argv) {
     uint64_t d1_pkts = (p1 && p1->valid.extDrop) ? p1->extDrop.pktsDedup : 0;
 
     double gbps0 = 0.0, gbps1 = 0.0;
-    if (p0) { gbps0 = (double)(p0->RMON1.octets - prev_octets[0]) * 8.0 / interval; prev_octets[0] = p0->RMON1.octets; }
-    if (p1) { gbps1 = (double)(p1->RMON1.octets - prev_octets[1]) * 8.0 / interval; prev_octets[1] = p1->RMON1.octets; }
+    if (p0) { gbps0 = ((double)(p0->RMON1.octets - prev_octets[0]) * 8.0 / interval) / 1e9; prev_octets[0] = p0->RMON1.octets; }
+    if (p1) { gbps1 = ((double)(p1->RMON1.octets - prev_octets[1]) * 8.0 / interval) / 1e9; prev_octets[1] = p1->RMON1.octets; }
 
-    since_summary += interval;
-    if (since_summary >= summary_period) { since_summary = 0.0; }
+    /* no summary window */
 
     clear_screen();
     char ts[64];
     printf("Traffic Impact Monitor            %s\n\n", now_str(ts, sizeof ts));
-    printf("Adapter %d  Interval %.1fs  Summary %.1fs  Color bit %d\n\n", adapter, interval, summary_period, color_bit);
+    printf("Adapter %d  Interval %.1fs  Color bit %d\n\n", adapter, interval, color_bit);
 
     // Stage-1 interface per tid-reqs-stage1.pdf
     // Stage-2 header: remove leading port indices in column labels
@@ -268,9 +267,10 @@ int main(int argc, char** argv) {
     // Stage-2 removes Drop counters, Dedup summary table, and adapter color totals
 
     if (sampling_enabled) {
-      printf("\nPCAP sample: p0=%u/%u p1=%u/%u  %s%s%s\n",
+      printf("\nPCAP sample: p0=%u/%u p1=%u/%u (port0=%d seen=%" PRIu64 ", port1=%d seen=%" PRIu64 ")\n",
              SC.wrote0, SC.path0?SC.target:0, SC.wrote1, SC.path1?SC.target:0,
-             SC.path0?"pcap0=":"", SC.path0?SC.path0:"", (SC.path0 && SC.path1)?" ":"");
+             SC.port0, SC.port_seen[(unsigned)SC.port0], SC.port1, SC.port_seen[(unsigned)SC.port1]);
+      if (SC.path0) printf("pcap0=%s\n", SC.path0);
       if (SC.path1) printf("pcap1=%s\n", SC.path1);
     }
 
