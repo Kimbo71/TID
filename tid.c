@@ -45,6 +45,12 @@ static void print_side_row(const char* label, uint64_t v0, uint64_t v1){
   printf("%-18s | #%018" PRIu64 " | #%018" PRIu64 "\n", label, v0, v1);
 }
 
+// Single-value row to match Stage-2 spec lines like "Port 1 = Port 2"
+static void print_single_row(const char* label, uint64_t v){
+  // Render only one numeric value in the first value column; second left blank
+  printf("%-18s | #%018" PRIu64 " |\n", label, v);
+}
+
 int main(int argc, char** argv) {
   int adapter = 0;
   double interval = 0.5;
@@ -139,9 +145,10 @@ int main(int argc, char** argv) {
     print_bw_row("RX Speed", gbps0, gbps1);
     print_side_row("Packets", v0_pkts, v1_pkts);
 
-    // Derived rows
-    // Port1 == Port2 would equal the dedup counter (note in spec: do not print this value directly)
-    // Show Port1 != Port2 as (Port0 pkts - dedup pkts on port1)
+    // Derived rows per Stage-2: explicitly show both equal and not-equal counts
+    // Port 1 = Port 2 is the dedup packet counter on Port 1
+    print_single_row("Port 1 = Port 2", d1_pkts);
+    // Port 1 != Port 2 is Port0 packets minus dedup pkts
     uint64_t forwarded_est = (v0_pkts >= d1_pkts) ? (v0_pkts - d1_pkts) : 0;
     print_side_row("Port 1 != Port 2", forwarded_est, 0);
 
@@ -182,4 +189,3 @@ int main(int argc, char** argv) {
   NT_Done();
   return 0;
 }
-
