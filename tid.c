@@ -155,10 +155,8 @@ int main(int argc, char** argv) {
     if (sampling_enabled && SC.path1) { SC.d1 = pcap_dump_open(SC.p_dead, SC.path1); if (!SC.d1) { fprintf(stderr, "pcap_dump_open %s: %s\n", SC.path1, pcap_geterr(SC.p_dead)); } }
     // Open a capture RX stream
     if (sampling_enabled) {
-      int sid_to_open = (rx_stream_id >= 0) ? rx_stream_id : -1;
-      int rc = NT_NetRxOpen(&SC.rx, "tid_cap", NT_NET_INTERFACE_PACKET, (uint32_t)sid_to_open, -1);
+      int rc = NT_NetRxOpen(&SC.rx, "tid_cap", NT_NET_INTERFACE_PACKET, adapter, rx_stream_id);
       if (rc != NT_SUCCESS) { die_nt("NT_NetRxOpen", rc); }
-      rx_stream_id = sid_to_open;
     }
     // Thread to pull and write samples
     if (sampling_enabled) {
@@ -223,8 +221,7 @@ int main(int argc, char** argv) {
 
     uint64_t v0_pkts = p0 ? p0->RMON1.pkts : 0;
     uint64_t v1_pkts = p1 ? p1->RMON1.pkts : 0;
-    // Use RX packet decode Duplicate counter for Port 1
-    uint64_t d1_pkts = (p1 && p1->valid.decode) ? p1->decode.pktsDuplicate : 0;
+    uint64_t d1_pkts = (p1 && p1->valid.extDrop) ? p1->extDrop.pktsDedup : 0;
 
     double gbps0 = 0.0, gbps1 = 0.0;
     if (p0) { gbps0 = ((double)(p0->RMON1.octets - prev_octets[0]) * 8.0 / interval) / 1e9; prev_octets[0] = p0->RMON1.octets; }
