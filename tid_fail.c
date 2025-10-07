@@ -21,33 +21,78 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#define ARRAY_LEN(x) (sizeof(x)/sizeof((x)[0]))
+
 // Delete oldest files with given prefix in dir until total size <= max_bytes
 static void prune_dir_budget(const char* dir, const char* prefix, uint64_t max_bytes){
   if (!dir || max_bytes==0) return;
   DIR* d = opendir(dir); if (!d) return;
   typedef struct { char path[768]; time_t mt; off_t sz; } ent_t;
-  ent_t list[1024]; size_t n=0; uint64_t total=0;
+  ent_t* list = NULL; size_t n=0, cap=0; uint64_t total=0;
   struct dirent* e;
+  size_t prefix_len = strlen(prefix);
   while ((e = readdir(d)) != NULL){
     if (e->d_name[0]=='.') continue;
     size_t len = strlen(e->d_name);
-    if (strncmp(e->d_name, prefix, strlen(prefix))!=0) continue;
-    if (len < 5 || strcmp(e->d_name+len-5, ".pcap")!=0) continue;
-    ent_t it; snprintf(it.path, sizeof it.path, "%s/%s", dir, e->d_name);
-    struct stat st; if (stat(it.path, &st)!=0) continue;
-    it.mt = st.st_mtime; it.sz = st.st_size; total += (uint64_t)st.st_size;
-    if (n < sizeof(list)/sizeof(list[0])) list[n++] = it;
+    if (len < 5 || strncmp(e->d_name, prefix, prefix_len)!=0 || strcmp(e->d_name+len-5, ".pcap")!=0)
+      continue;
+    if (n == cap){
+      size_t new_cap = cap ? cap * 2 : 64;
+      ent_t* tmp = realloc(list, new_cap * sizeof *list);
+      if (!tmp) { free(list); closedir(d); return; }
+      list = tmp; cap = new_cap;
+    }
+    ent_t* it = &list[n];
+    snprintf(it->path, sizeof it->path, "%s/%s", dir, e->d_name);
+    struct stat st; if (stat(it->path, &st)!=0) continue;
+    it->mt = st.st_mtime; it->sz = st.st_size; total += (uint64_t)st.st_size;
+    n++;
   }
   closedir(d);
-  if (total <= max_bytes) return;
+  if (total <= max_bytes || n==0) { free(list); return; }
   // insertion sort by mtime asc
   for (size_t i=1;i<n;i++){
     ent_t key=list[i]; size_t j=i; while (j>0 && list[j-1].mt > key.mt){ list[j]=list[j-1]; j--; } list[j]=key;
   }
-  size_t i=0; while (total > max_bytes && i<n){
-    unlink(list[i].path); if (total >= (uint64_t)list[i].sz) total -= (uint64_t)list[i].sz; else total = 0; i++;
+  for (size_t i=0; i<n && total > max_bytes; ++i){
+    unlink(list[i].path);
+    if (total >= (uint64_t)list[i].sz) total -= (uint64_t)list[i].sz; else total = 0;
   }
+  free(list);
 }
+
+typedef struct sample_ctx_s {
+  volatile sig_atomic_t running;
+  NtNetStreamRx_t rx;
+  pcap_t* p_dead;
+  int pcap_is_nano;
+  pcap_dumper_t* d0;
+  pcap_dumper_t* d1;
+  const char* path0;
+  const char* path1;
+  const char* dir0;
+  const char* dir1;
+  uint32_t snaplen;
+  uint32_t target;
+  uint32_t wrote0;
+  uint32_t wrote1;
+  int port0;
+  int port1;
+  double max_sec;
+  struct timespec t0;
+  uint64_t port_seen[256];
+  int rolling;
+  uint32_t roll_count;
+  double roll_seconds;
+  struct timespec roll0_t0;
+  struct timespec roll1_t0;
+  char cur0[512];
+  char cur1[512];
+  uint64_t roll_max_bytes;
+} sample_ctx_t;
+
+static void warn_nt(const char* where, int status);
+static void* capture_thread(void* arg);
 
 static volatile sig_atomic_t g_running = 1;
 static void on_sigint(int sig) { (void)sig; g_running = 0; }
@@ -61,8 +106,16 @@ static void die_nt(const char* where, int status) {
 
 static void sleep_interval(double seconds) {
   if (seconds <= 0.0) return;
-  struct timespec ts; ts.tv_sec = (time_t)seconds; ts.tv_nsec = (long)((seconds - ts.tv_sec) * 1e9);
-  if (ts.tv_nsec < 0) ts.tv_nsec = 0;
+  struct timespec ts;
+  ts.tv_sec = (time_t)seconds;
+  double frac = seconds - (double)ts.tv_sec;
+  if (frac < 0.0) frac = 0.0;
+  long nsec = (long)(frac * 1000000000.0 + 0.5);
+  if (nsec >= 1000000000L) {
+    ts.tv_sec += nsec / 1000000000L;
+    nsec %= 1000000000L;
+  }
+  ts.tv_nsec = nsec;
   nanosleep(&ts, NULL);
 }
 
@@ -87,6 +140,93 @@ static void print_side_row(const char* label, uint64_t v0, uint64_t v1){
 static void print_single_row(const char* label, uint64_t v){
   // Render only one numeric value in the first value column; second left blank
   printf("%-18s | #%018" PRIu64 " |\n", label, v);
+}
+
+static void warn_nt(const char* where, int status){
+  char buf[NT_ERRBUF_SIZE];
+  NT_ExplainError(status, buf, sizeof buf);
+  fprintf(stderr, "%s failed: %s (0x%08X)\n", where, buf, status);
+}
+
+static void* capture_thread(void* arg){
+  sample_ctx_t* C = (sample_ctx_t*)arg;
+  while (C->running) {
+    NtNetBuf_t nb = NULL;
+    int st = NT_NetRxGet(C->rx, &nb, 1000);
+    if (st==NT_STATUS_TIMEOUT || st==NT_STATUS_TRYAGAIN) {
+      if (C->max_sec > 0.0) {
+        struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+        double dt = (now.tv_sec - C->t0.tv_sec) + (now.tv_nsec - C->t0.tv_nsec)/1e9;
+        if (dt >= C->max_sec) C->running = 0;
+      }
+      continue;
+    }
+    if (st!=NT_SUCCESS) continue;
+
+    unsigned dtp = NT_NET_GET_PKT_DESCRIPTOR_TYPE(nb);
+    uint8_t* l2 = (uint8_t*)NT_NET_GET_PKT_L2_PTR(nb);
+    uint32_t cap = NT_NET_GET_PKT_CAP_LENGTH(nb);
+    uint32_t wire= NT_NET_GET_PKT_WIRE_LENGTH(nb);
+    unsigned int rxp = 255;
+    if (dtp == 4)      rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb)->rxPort;
+    else if (dtp == 3 || dtp == NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC)
+                        rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb)->rxPort;
+    if (rxp < ARRAY_LEN(C->port_seen))
+      C->port_seen[rxp]++;
+
+    uint64_t ts_ns = 0;
+    if (dtp == 4)      ts_ns = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb)->timestamp;
+    else if (dtp == 3 || dtp == NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC)
+                        ts_ns = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb)->timestamp;
+    else {
+      struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+      ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    }
+
+    struct pcap_pkthdr h; memset(&h, 0, sizeof h);
+    h.caplen = (C->snaplen==0) ? cap : (cap < C->snaplen ? cap : C->snaplen);
+    h.len = wire ? wire : h.caplen;
+    h.ts.tv_sec = (time_t)(ts_ns / 1000000000ULL);
+    if (C->pcap_is_nano) h.ts.tv_usec = (suseconds_t)(ts_ns % 1000000000ULL);
+    else h.ts.tv_usec = (suseconds_t)((ts_ns / 1000ULL) % 1000000ULL);
+
+    if (C->d0 && (int)rxp == C->port0) {
+      if (!C->rolling && C->target && C->wrote0 >= C->target) { /* stop writing */ }
+      else { pcap_dump((u_char*)C->d0, &h, l2); C->wrote0++; }
+    }
+    if (C->d1 && (int)rxp == C->port1) {
+      if (!C->rolling && C->target && C->wrote1 >= C->target) { /* stop writing */ }
+      else { pcap_dump((u_char*)C->d1, &h, l2); C->wrote1++; }
+    }
+
+    if (C->rolling) {
+      struct timespec now2; clock_gettime(CLOCK_REALTIME, &now2);
+      if (C->dir0 && C->d0) {
+        double dt0 = (now2.tv_sec - C->roll0_t0.tv_sec) + (now2.tv_nsec - C->roll0_t0.tv_nsec)/1e9;
+        if ((C->roll_count && C->wrote0 >= C->roll_count) || dt0 >= C->roll_seconds) {
+          pcap_dump_close(C->d0); C->d0=NULL;
+          char tsb[32]; time_t tt=now2.tv_sec; struct tm tm2; gmtime_r(&tt,&tm2); strftime(tsb,sizeof tsb, "%Y-%m-%dT%H-%M-%SZ", &tm2);
+          snprintf(C->cur0, sizeof C->cur0, "%s/port0_%s.pcap", C->dir0, tsb);
+          C->d0 = pcap_dump_open(C->p_dead, C->cur0); if (C->d0){ int fd = fileno((FILE*)pcap_dump_file(C->d0)); if (fd>=0) fchmod(fd, 0644);} C->wrote0=0; C->roll0_t0 = now2; if (C->roll_max_bytes) prune_dir_budget(C->dir0, "port0_", C->roll_max_bytes);
+        }
+      }
+      if (C->dir1 && C->d1) {
+        double dt1 = (now2.tv_sec - C->roll1_t0.tv_sec) + (now2.tv_nsec - C->roll1_t0.tv_nsec)/1e9;
+        if ((C->roll_count && C->wrote1 >= C->roll_count) || dt1 >= C->roll_seconds) {
+          pcap_dump_close(C->d1); C->d1=NULL;
+          char tsb[32]; time_t tt=now2.tv_sec; struct tm tm2; gmtime_r(&tt,&tm2); strftime(tsb,sizeof tsb, "%Y-%m-%dT%H-%M-%SZ", &tm2);
+          snprintf(C->cur1, sizeof C->cur1, "%s/port1_%s.pcap", C->dir1, tsb);
+          C->d1 = pcap_dump_open(C->p_dead, C->cur1); if (C->d1){ int fd = fileno((FILE*)pcap_dump_file(C->d1)); if (fd>=0) fchmod(fd, 0644);} C->wrote1=0; C->roll1_t0 = now2; if (C->roll_max_bytes) prune_dir_budget(C->dir1, "port1_", C->roll_max_bytes);
+        }
+      }
+    }
+
+    NT_NetRxRelease(C->rx, nb);
+    if ((C->path0 ? C->wrote0 >= C->target : 1) && (C->path1 ? C->wrote1 >= C->target : 1)) {
+      if (C->max_sec <= 0.0) C->running = 0;
+    }
+  }
+  return NULL;
 }
 
 int main(int argc, char** argv) {
@@ -190,93 +330,61 @@ int main(int argc, char** argv) {
   if (ntpl_mode != 0) {
     NtConfigStream_t cfg = NULL; NtNtplInfo_t info; memset(&info, 0, sizeof info);
     int st_cfg = NT_ConfigOpen(&cfg, "tid_cfg"); if (st_cfg != NT_SUCCESS) die_nt("NT_ConfigOpen", st_cfg);
-    char line[512]; int stn; int ntpl_failed = 0;
-    // helper to warn but continue
-    auto void warn_nt(const char* where, int status){ char b[NT_ERRBUF_SIZE]; NT_ExplainError(status,b,sizeof b); fprintf(stderr, "%s failed: %s (0x%08X)\n", where, b, status); };
+    char line[512]; int stn;
     // use chosen SID for NTPL setup/assign
-    uint32_t sid_ntpl = (rx_stream_id >= 0) ? (uint32_t)rx_stream_id : 1u;
+    uint32_t sid_ntpl = (rx_stream_id >= 0) ? (uint32_t)rx_stream_id : 0u;
     if (ntpl_clear) {
       snprintf(line, sizeof line, "Delete = All");
-      stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) { warn_nt("NT_NTPL(Delete)", stn); ntpl_failed = 1; }
+      stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) warn_nt("NT_NTPL(Delete)", stn);
     }
     if (ntpl_mode == 1) {
       // Duplicate + mark via ColorBit 7
       snprintf(line, sizeof line, "DeduplicationConfig[ColorBit=7; Retransmit=Duplicate] = GroupID == 0");
-      stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) { warn_nt("NT_NTPL(DedupConfig)", stn); ntpl_failed = 1; }
+      stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) warn_nt("NT_NTPL(DedupConfig)", stn);
     } else if (ntpl_mode == 2) {
       // Drop duplicates
       snprintf(line, sizeof line, "DeduplicationConfig[ColorBit=7; Retransmit=Drop] = GroupID == 0");
-      stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) { warn_nt("NT_NTPL(DedupConfig)", stn); ntpl_failed = 1; }
+      stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) warn_nt("NT_NTPL(DedupConfig)", stn);
     }
     snprintf(line, sizeof line, "Define ckFull = CorrelationKey(Begin=StartOfFrame[0], End=EndOfFrame[0], DeduplicationGroupID=0)");
-    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) { warn_nt("NT_NTPL(Define)", stn); ntpl_failed = 1; }
+    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) warn_nt("NT_NTPL(Define)", stn);
     snprintf(line, sizeof line, "Setup[State=Active] = StreamId == %u", sid_ntpl);
-    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) { warn_nt("NT_NTPL(Setup)", stn); ntpl_failed = 1; }
+    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) warn_nt("NT_NTPL(Setup)", stn);
     snprintf(line, sizeof line, "Assign[StreamId=%u; Descriptor=DYN3; CorrelationKey=ckFull] = Port == %d", sid_ntpl, port0_index);
-    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) { warn_nt("NT_NTPL(Assign p0)", stn); ntpl_failed = 1; }
+    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) warn_nt("NT_NTPL(Assign p0)", stn);
     snprintf(line, sizeof line, "Assign[StreamId=%u; Descriptor=DYN3; CorrelationKey=ckFull] = Port == %d", sid_ntpl, port1_index);
-    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) { warn_nt("NT_NTPL(Assign p1)", stn); ntpl_failed = 1; }
+    stn = NT_NTPL(cfg, line, &info, NT_NTPL_PARSER_VALIDATE_NORMAL); if (stn != NT_SUCCESS) warn_nt("NT_NTPL(Assign p1)", stn);
     NT_ConfigClose(cfg);
   }
 
-  // Optional PCAP sampling context
-  typedef struct {
-    volatile sig_atomic_t running;
-    NtNetStreamRx_t rx;
-    pcap_t* p_dead;
-    int pcap_is_nano;
-    pcap_dumper_t* d0;
-    pcap_dumper_t* d1;
-    const char* path0;
-    const char* path1;
-    const char* dir0;
-    const char* dir1;
-    uint32_t snaplen;
-    uint32_t target;
-    uint32_t wrote0;
-    uint32_t wrote1;
-    int port0;
-    int port1;
-    double max_sec;
-    struct timespec t0;
-    uint64_t port_seen[256];
-    // rolling
-    int rolling;
-    uint32_t roll_count;
-    double roll_seconds;
-    struct timespec roll0_t0;
-    struct timespec roll1_t0;
-    char cur0[512];
-    char cur1[512];
-    uint64_t roll_max_bytes;
-  } sample_ctx_t;
-
   sample_ctx_t SC = {0};
   pthread_t cap_thread;
+  int capture_thread_started = 0;
+  int open_dumpers = rolling || pcap0_path || pcap1_path;
 
-  // Default to rolling capture unless explicitly disabled
-  int sampling_enabled = rolling || pcap0_path || pcap1_path;
-  if (sampling_enabled) {
+  {
     SC.running = 1; SC.snaplen = snaplen; SC.target = sample_count; SC.max_sec = sample_seconds;
     SC.path0 = pcap0_path; SC.path1 = pcap1_path; SC.dir0 = pcap0_dir; SC.dir1 = pcap1_dir; SC.port0 = port0_index; SC.port1 = port1_index;
     SC.rolling = rolling; SC.roll_count = roll_count; SC.roll_seconds = roll_seconds; SC.roll_max_bytes = roll_max_bytes;
     clock_gettime(CLOCK_REALTIME, &SC.t0);
-    /* Prefer nanosecond precision PCAP if libpcap supports it */
+    if (open_dumpers) {
+      /* Prefer nanosecond precision PCAP if libpcap supports it */
 #ifdef PCAP_TSTAMP_PRECISION_NANO
-    {
-      uint32_t hdr_snap = (SC.snaplen == 0) ? 65535u : SC.snaplen;
-      SC.p_dead = pcap_open_dead_with_tstamp_precision(DLT_EN10MB, hdr_snap, PCAP_TSTAMP_PRECISION_NANO);
-    }
-    SC.pcap_is_nano = 1;
-    if (!SC.p_dead)
+      {
+        uint32_t hdr_snap = (SC.snaplen == 0) ? 65535u : SC.snaplen;
+        SC.p_dead = pcap_open_dead_with_tstamp_precision(DLT_EN10MB, hdr_snap, PCAP_TSTAMP_PRECISION_NANO);
+      }
+      SC.pcap_is_nano = 1;
+      if (!SC.p_dead)
 #endif
-    {
-      uint32_t hdr_snap = (SC.snaplen == 0) ? 65535u : SC.snaplen;
-      SC.p_dead = pcap_open_dead(DLT_EN10MB, hdr_snap);
-      SC.pcap_is_nano = 0;
+      {
+        uint32_t hdr_snap = (SC.snaplen == 0) ? 65535u : SC.snaplen;
+        SC.p_dead = pcap_open_dead(DLT_EN10MB, hdr_snap);
+        SC.pcap_is_nano = 0;
+      }
+      if (!SC.p_dead) { fprintf(stderr, "pcap_open_dead failed\n"); open_dumpers = 0; }
     }
-    if (!SC.p_dead) { fprintf(stderr, "pcap_open_dead failed\n"); sampling_enabled = 0; }
-    if (sampling_enabled) {
+    if (open_dumpers) {
       if (SC.rolling) {
         struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
         char tsbuf[32]; time_t t=now.tv_sec; struct tm tm; gmtime_r(&t,&tm); strftime(tsbuf,sizeof tsbuf, "%Y-%m-%dT%H-%M-%SZ", &tm);
@@ -295,88 +403,11 @@ int main(int argc, char** argv) {
     }
     // Thread to pull and write samples (always run; dumper pointers may be NULL when not writing)
     {
-      auto void* cap_fn(void* arg) {
-        sample_ctx_t* C = (sample_ctx_t*)arg;
-        while (C->running) {
-          NtNetBuf_t nb = NULL; int st = NT_NetRxGet(C->rx, &nb, 1000);
-          if (st==NT_STATUS_TIMEOUT || st==NT_STATUS_TRYAGAIN) {
-            // check time limit
-            if (C->max_sec > 0.0) {
-              struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
-              double dt = (now.tv_sec - C->t0.tv_sec) + (now.tv_nsec - C->t0.tv_nsec)/1e9;
-              if (dt >= C->max_sec) C->running = 0;
-            }
-            continue;
-          }
-          if (st!=NT_SUCCESS) continue;
-          unsigned dtp = NT_NET_GET_PKT_DESCRIPTOR_TYPE(nb);
-          uint8_t* l2 = (uint8_t*)NT_NET_GET_PKT_L2_PTR(nb);
-          uint32_t cap = NT_NET_GET_PKT_CAP_LENGTH(nb);
-          uint32_t wire= NT_NET_GET_PKT_WIRE_LENGTH(nb);
-          uint8_t rxp = 255;
-          if (dtp == 4)      rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb)->rxPort;
-          else if (dtp == 3 || dtp == NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC)
-                              rxp = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb)->rxPort;
-          C->port_seen[rxp]++;
-          /* Timestamp: use original Napatech descriptor timestamp (ns) */
-          uint64_t ts_ns = 0;
-          if (dtp == 4)      ts_ns = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb)->timestamp;
-          else if (dtp == 3 || dtp == NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC)
-                              ts_ns = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb)->timestamp;
-          else {
-            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-            ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-          }
-          struct pcap_pkthdr h; memset(&h, 0, sizeof h);
-          h.caplen = (C->snaplen==0) ? cap : (cap < C->snaplen ? cap : C->snaplen);
-          h.len = wire ? wire : h.caplen;
-          h.ts.tv_sec = (time_t)(ts_ns / 1000000000ULL);
-          if (C->pcap_is_nano) {
-            /* With nano-precision dumper, tv_usec carries nanoseconds (0..999,999,999) */
-            h.ts.tv_usec = (suseconds_t)(ts_ns % 1000000000ULL);
-          } else {
-            /* Fallback: write microsecond precision */
-            h.ts.tv_usec = (suseconds_t)((ts_ns / 1000ULL) % 1000000ULL);
-          }
-          if (C->d0 && rxp == (uint8_t)C->port0) {
-            if (!C->rolling && C->target && C->wrote0 >= C->target) { /* stop writing */ }
-            else { pcap_dump((u_char*)C->d0, &h, l2); C->wrote0++; }
-          }
-          if (C->d1 && rxp == (uint8_t)C->port1) {
-            if (!C->rolling && C->target && C->wrote1 >= C->target) { /* stop writing */ }
-            else { pcap_dump((u_char*)C->d1, &h, l2); C->wrote1++; }
-          }
-          // Rolling rotation
-          if (C->rolling) {
-            struct timespec now2; clock_gettime(CLOCK_REALTIME, &now2);
-            if (C->dir0 && C->d0) {
-              double dt0 = (now2.tv_sec - C->roll0_t0.tv_sec) + (now2.tv_nsec - C->roll0_t0.tv_nsec)/1e9;
-              if ((C->roll_count && C->wrote0 >= C->roll_count) || dt0 >= C->roll_seconds) {
-                pcap_dump_close(C->d0); C->d0=NULL;
-                char tsb[32]; time_t tt=now2.tv_sec; struct tm tm2; gmtime_r(&tt,&tm2); strftime(tsb,sizeof tsb, "%Y-%m-%dT%H-%M-%SZ", &tm2);
-                snprintf(C->cur0, sizeof C->cur0, "%s/port0_%s.pcap", C->dir0, tsb);
-                C->d0 = pcap_dump_open(C->p_dead, C->cur0); if (C->d0){ int fd = fileno((FILE*)pcap_dump_file(C->d0)); if (fd>=0) fchmod(fd, 0644);} C->wrote0=0; C->roll0_t0 = now2; if (C->roll_max_bytes) prune_dir_budget(C->dir0, "port0_", C->roll_max_bytes);
-              }
-            }
-            if (C->dir1 && C->d1) {
-              double dt1 = (now2.tv_sec - C->roll1_t0.tv_sec) + (now2.tv_nsec - C->roll1_t0.tv_nsec)/1e9;
-              if ((C->roll_count && C->wrote1 >= C->roll_count) || dt1 >= C->roll_seconds) {
-                pcap_dump_close(C->d1); C->d1=NULL;
-                char tsb[32]; time_t tt=now2.tv_sec; struct tm tm2; gmtime_r(&tt,&tm2); strftime(tsb,sizeof tsb, "%Y-%m-%dT%H-%M-%SZ", &tm2);
-                snprintf(C->cur1, sizeof C->cur1, "%s/port1_%s.pcap", C->dir1, tsb);
-                C->d1 = pcap_dump_open(C->p_dead, C->cur1); if (C->d1){ int fd = fileno((FILE*)pcap_dump_file(C->d1)); if (fd>=0) fchmod(fd, 0644);} C->wrote1=0; C->roll1_t0 = now2; if (C->roll_max_bytes) prune_dir_budget(C->dir1, "port1_", C->roll_max_bytes);
-              }
-            }
-          }
-          NT_NetRxRelease(C->rx, nb);
-          if ((C->path0?C->wrote0>=C->target:1) && (C->path1?C->wrote1>=C->target:1)) {
-            if (C->max_sec <= 0.0) C->running = 0; // stop when reached targets (unless a time window specified)
-          }
-        }
-        return (void*)0;
+      if (pthread_create(&cap_thread, NULL, capture_thread, &SC) != 0) {
+        perror("pthread_create");
+        exit(EXIT_FAILURE);
       }
-      ;
-      pthread_create(&cap_thread, NULL, cap_fn, &SC);
+      capture_thread_started = 1;
     }
   }
 
@@ -443,7 +474,7 @@ int main(int argc, char** argv) {
 
     // Stage-2 removes Drop counters, Dedup summary table, and adapter color totals
 
-    if (sampling_enabled) {
+    if (open_dumpers) {
       if (SC.rolling) {
         if (SC.roll_count) {
           printf("\nPCAP rolling: p0=%u/%u p1=%u/%u (port0=%d seen=%" PRIu64 ", port1=%d seen=%" PRIu64 ")\n",
@@ -470,13 +501,14 @@ int main(int argc, char** argv) {
   }
 
   NT_StatClose(stat_stream);
-  if (sampling_enabled) {
+  if (capture_thread_started) {
     SC.running = 0;
-    if (SC.rx) NT_NetRxClose(SC.rx);
-    if (SC.d0) { pcap_dump_close(SC.d0); }
-    if (SC.d1) { pcap_dump_close(SC.d1); }
-    if (SC.p_dead) { pcap_close(SC.p_dead); }
+    pthread_join(cap_thread, NULL);
   }
+  if (SC.rx) NT_NetRxClose(SC.rx);
+  if (SC.d0) { pcap_dump_close(SC.d0); }
+  if (SC.d1) { pcap_dump_close(SC.d1); }
+  if (SC.p_dead) { pcap_close(SC.p_dead); }
   NT_Done();
   return 0;
 }
