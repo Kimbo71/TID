@@ -1,3 +1,27 @@
+/**
+ * Traffic Impact Monitor (tid.c)
+ *
+ * Build:
+ *   gcc -O2 -g -pthread src/c/tid.c \
+ *       -I/opt/napatech3/include \
+ *       -L/opt/napatech3/lib \
+ *       -lpcap -lntapi \
+ *       -o bin/tid
+ *
+ * The binary expects the Napatech capture libraries to be available in the
+ * include/library paths above. Adjust paths if your SDK is installed elsewhere.
+ *
+ * Expected NTPL configuration (Stream ID 0 by default):
+ *   Delete = All
+ *   DeduplicationConfig[ColorBit=7; Retransmit=Duplicate] = GroupID == 0
+ *   Define ckFull = CorrelationKey(Begin=StartOfFrame[0], End=EndOfFrame[0], DeduplicationGroupID=0)
+ *   Setup[State=Active] = StreamId == 0
+ *   Assign[StreamId=0; Descriptor=DYN3; CorrelationKey=ckFull] = Port == <port0>
+ *   Assign[StreamId=0; Descriptor=DYN3; CorrelationKey=ckFull] = Port == <port1>
+ *
+ * Use the --ntpl-* command-line options to have the monitor push a compatible
+ * configuration automatically, or pre-load NTPL as shown above before running.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

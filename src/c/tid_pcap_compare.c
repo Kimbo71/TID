@@ -1,3 +1,16 @@
+/**
+ * Traffic PCAP Compare (tid_pcap_compare.c)
+ *
+ * Build:
+ *   gcc -O2 -g src/c/tid_pcap_compare.c \
+ *       -I/opt/napatech3/include \
+ *       -L/opt/napatech3/lib \
+ *       -lpcap -lntapi \
+ *       -o bin/tid_pcap_compare
+ *
+ * The tool compares two PCAP capture streams (or rolling directories) and can
+ * tolerate re-ordered packets when used with the --window-us option.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
