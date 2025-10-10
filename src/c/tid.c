@@ -21,7 +21,13 @@
  *
  * Use the --ntpl-* command-line options to have the monitor push a compatible
  * configuration automatically, or pre-load NTPL as shown above before running.
- */
+ *
+ * Example:
+ *   bin/tid --adapter 0 --rx-stream-id 0 --interval 0.5 \
+ *           --pcap0-dir /dev/shm --pcap1-dir /dev/shm \
+ *           --roll-seconds 60 --roll-count 500 \
+ *           --ntpl-duplicate --ntpl-clear
+*/
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

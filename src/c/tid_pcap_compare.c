@@ -10,6 +10,13 @@
  *
  * The tool compares two PCAP capture streams (or rolling directories) and can
  * tolerate re-ordered packets when used with the --window-us option.
+ *
+ * Examples:
+ *   bin/tid_pcap_compare --pcap0 port0.pcap --pcap1 port1.pcap \\
+ *       --offset1 1 --window-us 1000 --print-first-diff
+ *
+ *   bin/tid_pcap_compare --pcap0-dir /dev/shm --pcap1-dir /dev/shm \\
+ *       --scan-all --window-us 1000 --auto-report-dir /tmp/diff_reports
  */
 #define _GNU_SOURCE
 #include <stdio.h>
