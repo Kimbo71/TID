@@ -2,11 +2,7 @@
   "trex_server": "127.0.0.1",
   "src_mac": "bc:d0:74:59:9b:9e",
   "dst_mac": "00:e0:4c:77:8d:e0",
-  "src_ip_base": "192.168.0.",
-  "dst_ip": "20.0.0.1",
-  "src_port": 1234,
-  "dst_port": 443,
-  "min_size": 64,
+  "min_size": 128,
   "max_size": 1500,
   "num_streams": 5000,
   "pps_per_stream": 10,
@@ -38,9 +34,9 @@
   "pattern_ratios": "0",
   "ramp_steps": 1,
   "load_profile": null,
-  "src_ip_range": "192.168.0.1-192.168.100.1",
-  "dst_ip_list": "20.0.0.1,20.100.0.2",
-  "dst_ip_range": "",
+  "src_ip_range": "192.168.0.1-192.168.10.1",
+  "dst_ip_range": "20.0.0.1-20.0.50.254",
   "src_port_range": "1200-1250",
-  "dst_port_range": "4000-4010"
+  "dst_port_range": "4000-4010",
+  "dup_factor": 1
 }
