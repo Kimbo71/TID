@@ -658,7 +658,6 @@ def main():
                     pkts_per_burst=dup_factor,
                     ibg=0.0,
                     count=0,
-                    isg=0.0,
                     pps=args.pps_per_stream
                 )
             else:
