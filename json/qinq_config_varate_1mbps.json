@@ -38,5 +38,7 @@
   "dst_ip_range": "20.0.0.1-20.0.50.254",
   "src_port_range": "1200-1250",
   "dst_port_range": "4000-4010",
-  "dup_factor": 1
+  "dup_factor": 4,
+  "duplicate_test": true,
+  "duplicate_src_ip": "192.168.0.1"
 }
