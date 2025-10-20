@@ -27,7 +27,7 @@ def build_qinq_packet(src_mac, dst_mac, src_ip, dst_ip,
                       src_port, dst_port, s_vlan, c_vlan, pkt_size,
                       outer_tpid=0x88a8, l4_proto="udp", tcp_flags="S"):
     """
-    Build a QinQ (double-tagged) IP/UDP frame.
+    Build a QinQ (double-tagged) IP packet carrying UDP or TCP.
 
     outer_tpid:
       0x88a8 -> 802.1ad (S-TAG, provider QinQ)  [recommended]
