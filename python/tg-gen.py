@@ -435,6 +435,10 @@ def build_arg_parser():
     p.add_argument("--pps_per_stream", type=int, default=50)
     p.add_argument("--dup_factor", type=int, default=2,
                    help="Number of identical packets transmitted back-to-back per stream (>=1).")
+    p.add_argument("--duplicate_test", action="store_true",
+                   help="Force a single stream that emits duplicate packets from one source IP for testing.")
+    p.add_argument("--duplicate_src_ip", default=None,
+                   help="Source IPv4 address to use with --duplicate_test. Defaults to first in range/base.")
 
     # Ports & modes
     p.add_argument("--ports", type=int, nargs="+", default=[0, 1])
@@ -579,6 +583,17 @@ def parse_args_2stage():
 def main():
     args = parse_args_2stage()
     dup_factor = max(1, args.dup_factor)
+    dup_test_mode = bool(args.duplicate_test)
+    if dup_test_mode and dup_factor < 2:
+        dup_factor = 2
+
+    if args.duplicate_src_ip:
+        dup_src_ip = args.duplicate_src_ip.strip()
+    elif args._src_ip_list:
+        dup_src_ip = args._src_ip_list[0]
+    else:
+        dup_src_ip = args.src_ip_base + "1"
+    dup_dst_ip = args._dst_ip_list[0] if args._dst_ip_list else args.dst_ip
 
     client = STLClient(server=args.trex_server)
     client.connect()
@@ -611,30 +626,42 @@ def main():
     for txp in tx_ports:
         dst_mac_for_port = peer_map.get(txp, args.dst_mac)
         streams = []
-        for i in range(args.num_streams):
-            if src_cycle:
-                user_ip = src_cycle[i % len(src_cycle)]
-            else:
-                user_ip = args.src_ip_base + str(1 + (i % 254))
-            s_vlan = args.s_vlan_start + (i % args.s_vlan_count)
-            c_vlan = args.c_vlan_start + (i % args.c_vlan_count)
-            pkt_size = random.randint(args.min_size, args.max_size)
-
-            proto = proto_cycle[i % len(proto_cycle)]
-            tcp_flag = tcp_flag_cycle[i % len(tcp_flag_cycle)]
-            dst_ip = dst_ip_cycle[i % len(dst_ip_cycle)]
-
-            if args._src_port_list:
-                src_port = args._src_port_list[i % len(args._src_port_list)]
-            else:
-                src_port = args.src_port + i
-
-            if args._dst_port_list:
-                dst_port = args._dst_port_list[i % len(args._dst_port_list)]
-            else:
+        stream_count = 1 if dup_test_mode else args.num_streams
+        for i in range(stream_count):
+            if dup_test_mode:
+                user_ip = dup_src_ip
+                s_vlan = args.s_vlan_start
+                c_vlan = args.c_vlan_start
+                pkt_size = args.max_size
+                proto = proto_cycle[0]
+                tcp_flag = tcp_flag_cycle[0]
+                dst_ip = dup_dst_ip
+                src_port = args.src_port
                 dst_port = args.dst_port
+            else:
+                if src_cycle:
+                    user_ip = src_cycle[i % len(src_cycle)]
+                else:
+                    user_ip = args.src_ip_base + str(1 + (i % 254))
+                s_vlan = args.s_vlan_start + (i % args.s_vlan_count)
+                c_vlan = args.c_vlan_start + (i % args.c_vlan_count)
+                pkt_size = random.randint(args.min_size, args.max_size)
 
-            stamp_head_bytes = args._stamp_head_bytes if dup_factor == 1 else 0
+                proto = proto_cycle[i % len(proto_cycle)]
+                tcp_flag = tcp_flag_cycle[i % len(tcp_flag_cycle)]
+                dst_ip = dst_ip_cycle[i % len(dst_ip_cycle)]
+
+                if args._src_port_list:
+                    src_port = args._src_port_list[i % len(args._src_port_list)]
+                else:
+                    src_port = args.src_port + i
+
+                if args._dst_port_list:
+                    dst_port = args._dst_port_list[i % len(args._dst_port_list)]
+                else:
+                    dst_port = args.dst_port
+
+            stamp_head_bytes = 0 if (dup_factor > 1 or dup_test_mode) else args._stamp_head_bytes
             scapy_pkt, payload_off = build_qinq_packet(
                 args.src_mac, dst_mac_for_port, user_ip, dst_ip,
                 src_port, dst_port,
@@ -669,6 +696,8 @@ def main():
 
     if dup_factor > 1:
         print(f"[dup] Burst mode enabled: each stream transmits {dup_factor} identical packets")
+    if dup_test_mode:
+        print(f"[dup] Duplicate test: single stream on {dup_src_ip} -> {dup_dst_ip}, VLAN {args.s_vlan_start}/{args.c_vlan_start}")
 
     # Save a small sample PCAP of generated packets (from first TX port)
     if pcap_path and scapy_sample:
