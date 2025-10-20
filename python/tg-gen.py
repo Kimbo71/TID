@@ -6,6 +6,7 @@ import csv
 import time
 import json
 import random
+import ipaddress
 from datetime import datetime
 
 # --- TRex API path ---
@@ -15,8 +16,7 @@ if TREX_API_PATH not in sys.path:
 
 from trex_stl_lib.api import (
     STLClient, STLStream, STLPktBuilder, STLTXCont,
-    STLScVmRaw, STLVmFixIpv4, STLVmFixChecksumHw,
-    STLVmFlowVar, STLVmWrFlowVar
+    STLScVmRaw, STLVmFixIpv4, STLVmFixChecksumHw, STLVmFlowVar, STLVmWrFlowVar
 )
 from scapy.all import Ether, Dot1Q, IP, UDP, TCP, Raw, wrpcap
 
@@ -24,26 +24,22 @@ from scapy.all import Ether, Dot1Q, IP, UDP, TCP, Raw, wrpcap
 # ---------------------------------------------------------
 # QinQ Packet Builder (outer_tpid supports 0x88a8 or 0x8100)
 # ---------------------------------------------------------
-def build_qinq_packet(src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port,
-                      s_vlan, c_vlan, pkt_size, outer_tpid=0x88a8,
-                      stamp_head_bytes=0, l4_proto="udp", tcp_flags="S"):
-    """
-    Build a QinQ (double-tagged) IP packet carrying UDP or TCP and return:
-      (packet_with_payload, payload_offset)
 
-    - stamp_head_bytes: 0, 8, or 16. Ensures there is at least this many bytes
-      available at the *start of the transport payload* for stamping.
+def build_qinq_packet(src_mac, dst_mac, src_ip, dst_ip,
+                      src_port, dst_port, s_vlan, c_vlan, pkt_size,
+                      outer_tpid=0x88a8, l4_proto="udp", tcp_flags="S", stamp_head_bytes=0):
     """
-    # Outer TPID sits in Ethernet.type
+    Build a QinQ (double-tagged) IP packet (UDP or TCP) and ensure space for optional
+    payload stamping. Returns a tuple (packet, payload_offset).
+    """
+    if stamp_head_bytes not in (0, 8, 16):
+        raise ValueError("stamp_head_bytes must be 0, 8, or 16")
+
     ether = Ether(src=src_mac, dst=dst_mac, type=outer_tpid)
-
-    # First Dot1Q is the OUTER tag; 'type=0x8100' indicates another VLAN follows.
     s_tag = Dot1Q(vlan=s_vlan, type=0x8100)
-
-    # Second Dot1Q is the INNER tag (its type will be set by next layer, e.g. IPv4 0x0800)
     c_tag = Dot1Q(vlan=c_vlan)
 
-    ip = IP(src=src_ip, dst=dst_ip)      # leave checksums as None (Scapy default)
+    ip = IP(src=src_ip, dst=dst_ip)
     l4p = str(l4_proto).lower()
     if l4p == "tcp":
         tcp = TCP(sport=src_port, dport=dst_port,
@@ -54,72 +50,49 @@ def build_qinq_packet(src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port,
         l4 = udp
 
     base = ether / s_tag / c_tag / ip / l4
-    payload_offset = len(base)
+    payload_off = len(base)
+    pad = pkt_size - payload_off
+    if pad < stamp_head_bytes:
+        raise ValueError(f"Packet size too small for headers+stamp ({payload_off}+{stamp_head_bytes} > {pkt_size})")
 
-    # Guarantee enough room for requested head-stamp (and meet 64B min without FCS)
-    min_needed = payload_offset + max(0, int(stamp_head_bytes))
-    pkt_size = max(int(pkt_size), min_needed, 64)
+    stamp_region = b"\x00" * stamp_head_bytes
+    random_tail = os.urandom(pad - stamp_head_bytes) if pad > stamp_head_bytes else b""
+    pkt = base / Raw(stamp_region + random_tail)
+    return pkt, payload_off
 
-    pad = pkt_size - len(base)
-    if pad < 0:
-        raise ValueError(f"Packet size too small for QinQ headers. min={len(base)} got={pkt_size}")
-
-    return (base / Raw(b"Q" * pad), payload_offset)
 
 
 # ---------------------------------------------------------
-# Build Field-Engine program: payload stamp + checksum fix
+# Field Engine helpers (sequence/timestamp stamping + checksum fix)
 # ---------------------------------------------------------
 def build_vm_program(payload_off, l4_proto="udp", stamp_head_bytes=16, fix_checksums=True):
-    """
-    Creates a single STLScVmRaw with:
-      - 8B sequence counter at payload_off (always big-endian)
-      - Optional 8B monotonic tick at payload_off+8
-      - IPv4 + L4 checksum fix via HW offload (if enabled)
-
-    Returns None if no VM commands are needed.
-    """
-    vm_cmds = []
-    # 64-bit safe upper-bound to avoid signed/overflow issues in some TRex builds
-    MAX64_SAFE = (1 << 63) - 1
-
-    # 8 bytes: sequence counter (monotonic increment)
+    cmds = []
+    MAX64 = (1 << 63) - 1
     if stamp_head_bytes >= 8:
-        vm_cmds += [
-            STLVmFlowVar(name="seq64", init_value=0, min_value=0,
-                         max_value=MAX64_SAFE, size=8, op="inc"),
-            STLVmWrFlowVar(fv_name="seq64", pkt_offset=int(payload_off))
-        ]
-
-    # next optional 8 bytes: a second monotonic counter ("ticks")
+        cmds.append(STLVmFlowVar(name="seq64", init_value=0, min_value=0,
+                                 max_value=MAX64, size=8, op="inc"))
+        cmds.append(STLVmWrFlowVar(fv_name="seq64", pkt_offset=int(payload_off)))
     if stamp_head_bytes >= 16:
-        vm_cmds += [
-            STLVmFlowVar(name="tick64", init_value=0, min_value=0,
-                         max_value=MAX64_SAFE, size=8, op="inc"),
-            STLVmWrFlowVar(fv_name="tick64", pkt_offset=int(payload_off) + 8)
-        ]
+        cmds.append(STLVmFlowVar(name="tick64", init_value=0, min_value=0,
+                                 max_value=MAX64, size=8, op="inc"))
+        cmds.append(STLVmWrFlowVar(fv_name="tick64", pkt_offset=int(payload_off) + 8))
 
     if fix_checksums:
-        # Prefer symbolic constants; fall back gracefully if not available
         l4p = str(l4_proto).lower()
         l4_name = "UDP" if l4p == "udp" else "TCP"
+        l4_type_int = 17 if l4p == "udp" else 6
         try:
-            # Provided by trex.stl.trex_stl_packet_builder_scapy
-            from trex.stl.trex_stl_packet_builder_scapy import CTRexVmInsFixHwCs
-            l4_type = CTRexVmInsFixHwCs.L4_TYPE_UDP if l4_name == "UDP" else CTRexVmInsFixHwCs.L4_TYPE_TCP
-            vm_cmds += [
+            cmds.extend([
                 STLVmFixIpv4(offset="IP"),
-                STLVmFixChecksumHw(l3_offset="IP", l4_offset=l4_name, l4_type=l4_type),
-            ]
-        except Exception:
-            # Older Python client: accept no l4_type (server infers)
-            vm_cmds += [
+                STLVmFixChecksumHw(l3_offset="IP", l4_offset=l4_name, l4_type=l4_type_int),
+            ])
+        except TypeError:
+            cmds.extend([
                 STLVmFixIpv4(offset="IP"),
                 STLVmFixChecksumHw(l3_offset="IP", l4_offset=l4_name),
-            ]
+            ])
 
-    return STLScVmRaw(vm_cmds) if vm_cmds else None
-
+    return STLScVmRaw(cmds) if cmds else None
 
 # ---------------------------------------------------------
 # Stats Collection (CSV)
@@ -229,6 +202,45 @@ def get_port_mac(client, port_id):
         if hasattr(attr, key):
             return getattr(attr, key)
     return None
+
+
+def expand_ip_range(range_str):
+    """Return list of IPv4 strings covering inclusive start-end (handles single value)."""
+    range_str = str(range_str or "").strip()
+    if not range_str:
+        return []
+    if "-" not in range_str:
+        addr = ipaddress.IPv4Address(range_str.strip())
+        return [str(addr)]
+    start_s, end_s = [part.strip() for part in range_str.split("-", 1)]
+    start_ip = int(ipaddress.IPv4Address(start_s))
+    end_ip = int(ipaddress.IPv4Address(end_s))
+    if end_ip < start_ip:
+        raise ValueError(f"IP range end {end_s} precedes start {start_s}")
+    if end_ip - start_ip > 65536:
+        raise ValueError("IP range too large; limit to <= 65537 addresses")
+    return [str(ipaddress.IPv4Address(val)) for val in range(start_ip, end_ip + 1)]
+
+
+def expand_port_range(range_str, default):
+    range_str = str(range_str or "").strip()
+    if not range_str:
+        return []
+    if "-" not in range_str:
+        val = int(range_str)
+        if not (0 <= val <= 65535):
+            raise ValueError(f"Port {val} out of range 0-65535")
+        return [val]
+    start_s, end_s = [part.strip() for part in range_str.split("-", 1)]
+    start = int(start_s)
+    end = int(end_s)
+    if not (0 <= start <= 65535) or not (0 <= end <= 65535):
+        raise ValueError("Port range values must be between 0 and 65535")
+    if end < start:
+        raise ValueError(f"Port range end {end} precedes start {start}")
+    if end - start > 65535:
+        raise ValueError("Port range too large; limit to <= 65536 ports")
+    return list(range(start, end + 1))
 
 def print_port_macs(client, ports):
     macs = {}
@@ -364,8 +376,6 @@ def build_auto_load_profile(duration_sec, start_load, max_load,
         else:
             raise ValueError(f"Unknown token in profile_pattern: '{tok}'")
     return phases
-
-
 # ---------------------------------------------------------
 # Run-time rate changer
 # ---------------------------------------------------------
@@ -394,7 +404,7 @@ def run_load_profile(client, tx_ports, phases, force=False):
 # ---------------------------------------------------------
 def build_arg_parser():
     p = argparse.ArgumentParser(
-        description="QinQ VarSize Runner with VLAN ranges, TX/RX mode, CSV logging, RX capture, checksum fix, load profile, and payload head stamp"
+        description="QinQ VarSize Runner with VLAN ranges, TX/RX mode, CSV logging, RX capture, checksum fix, and load profile"
     )
     p.set_defaults(fix_checksums=True)  # default: ON
 
@@ -404,9 +414,21 @@ def build_arg_parser():
     p.add_argument("--src_mac", default="bc:d0:74:59:9b:9e")
     p.add_argument("--dst_mac", default="00:e0:4c:77:8d:e0")
     p.add_argument("--src_ip_base", default="192.168.0.")
+    p.add_argument("--src_ip_range", default="",
+                   help="Optional inclusive range 'start-end' to roll source IPs (overrides src_ip_base)")
     p.add_argument("--dst_ip", default="20.0.0.1")
-    p.add_argument("--src_port", type=int, default=1234)
-    p.add_argument("--dst_port", type=int, default=443)
+    p.add_argument("--dst_ip_range", default="",
+                   help="Optional inclusive range 'start-end' to build destination list")
+    p.add_argument("--dst_ip_list", default="",
+                   help="Comma list of destination IPs to roll across per stream")
+    p.add_argument("--src_port", type=int, default=1234,
+                   help="Base source port (used if no range provided)")
+    p.add_argument("--dst_port", type=int, default=443,
+                   help="Base destination port (used if no range provided)")
+    p.add_argument("--src_port_range", default="",
+                   help="Optional inclusive range 'start-end' for source ports")
+    p.add_argument("--dst_port_range", default="",
+                   help="Optional inclusive range 'start-end' for destination ports")
     p.add_argument("--min_size", type=int, default=64)
     p.add_argument("--max_size", type=int, default=1500)
     p.add_argument("--num_streams", type=int, default=300)
@@ -448,10 +470,12 @@ def build_arg_parser():
                    help="Fix IP and L4 checksums on transmit (default: on; use --no-fix-checksums to disable)")
     p.add_argument("--no-fix-checksums", action="store_true",
                    help="Disable checksum fixing (overrides --fix_checksums)")
-    p.add_argument("--l4_proto", choices=["udp", "tcp"], default="udp",
-                   help="Choose UDP or TCP payloads")
+    p.add_argument("--l4_protos", default="udp",
+                   help="Comma list of protocols per stream (e.g. 'udp,tcp,udp'). Accepted values: udp, tcp.")
     p.add_argument("--tcp_flags", default="S",
-                   help="TCP flags when --l4_proto tcp (e.g. 'S', 'PA')")
+                   help="TCP flags sequence matching TCP streams (single value or comma list)")
+    p.add_argument("--stamp-head-bytes", type=int, choices=[0, 8, 16], default=16,
+                   help="Bytes reserved at start of payload for stamping (0 disables)")
 
     # TRex server
     p.add_argument("--trex_server", default="127.0.0.1")
@@ -472,11 +496,6 @@ def build_arg_parser():
                    help="Comma ratios totaling 1.0 matching pattern phases (e.g. '0.3,0.2,0.3,0.2')")
     p.add_argument("--ramp_steps", type=int, default=20,
                    help="Number of linear steps for each ramp in the auto profile")
-
-    # Payload head stamping
-    p.add_argument("--stamp_head_bytes", type=int, choices=[0, 8, 16], default=16,
-                   help="Write 8 or 16 bytes at the *start* of the UDP payload: "
-                        "first 8B=seq counter (big-endian), next 8B=monotonic tick. 0=disable.")
 
     return p
 
@@ -512,9 +531,40 @@ def parse_args_2stage():
     if isinstance(args.outer_tpid, str):
         args.outer_tpid = int(args.outer_tpid, 0)
 
-    # Resolve checksum toggles (default True; --no-fix-checksums forces False)
     if getattr(args, "no_fix_checksums", False):
         args.fix_checksums = False
+
+    proto_tokens = [tok.strip().lower() for tok in str(args.l4_protos).split(',') if tok.strip()]
+    if not proto_tokens:
+        proto_tokens = ['udp']
+    valid = {'udp', 'tcp'}
+    for tok in proto_tokens:
+        if tok not in valid:
+            raise ValueError(f"Unsupported protocol '{tok}'. Allowed: udp,tcp")
+
+    tcp_flags_seq = [tok.strip() for tok in str(args.tcp_flags).split(',') if tok.strip()]
+    if not tcp_flags_seq:
+        tcp_flags_seq = ['S']
+
+    args._l4_proto_list = proto_tokens
+    args._tcp_flags_list = tcp_flags_seq
+
+    src_range = expand_ip_range(args.src_ip_range)
+    args._src_ip_list = src_range if src_range else None
+
+    if args.dst_ip_range:
+        dst_list = expand_ip_range(args.dst_ip_range)
+    else:
+        dst_list = [ip.strip() for ip in str(args.dst_ip_list).split(',') if ip.strip()]
+    if not dst_list:
+        dst_list = [args.dst_ip]
+    args._dst_ip_list = dst_list
+
+    src_ports = expand_port_range(args.src_port_range, args.src_port)
+    dst_ports = expand_port_range(args.dst_port_range, args.dst_port)
+    args._src_port_list = src_ports if src_ports else None
+    args._dst_port_list = dst_ports if dst_ports else None
+    args._stamp_head_bytes = args.stamp_head_bytes
 
     return args
 
@@ -548,39 +598,54 @@ def main():
     pcap_path = safe_path(args.pcap_out) if args.pcap_out else None
     scapy_sample = []
 
+    proto_cycle = args._l4_proto_list
+    tcp_flag_cycle = args._tcp_flags_list
+    dst_ip_cycle = args._dst_ip_list
+    src_cycle = args._src_ip_list
+
     for txp in tx_ports:
         dst_mac_for_port = peer_map.get(txp, args.dst_mac)
         streams = []
         for i in range(args.num_streams):
-            user_ip = args.src_ip_base + str(1 + (i % 254))
+            if src_cycle:
+                user_ip = src_cycle[i % len(src_cycle)]
+            else:
+                user_ip = args.src_ip_base + str(1 + (i % 254))
             s_vlan = args.s_vlan_start + (i % args.s_vlan_count)
             c_vlan = args.c_vlan_start + (i % args.c_vlan_count)
+            pkt_size = random.randint(args.min_size, args.max_size)
 
-            # Random size, but ensure header+stamp fits
-            requested_size = random.randint(args.min_size, args.max_size)
+            proto = proto_cycle[i % len(proto_cycle)]
+            tcp_flag = tcp_flag_cycle[i % len(tcp_flag_cycle)]
+            dst_ip = dst_ip_cycle[i % len(dst_ip_cycle)]
 
-            # Build packet and compute payload offset (start of UDP payload)
+            if args._src_port_list:
+                src_port = args._src_port_list[i % len(args._src_port_list)]
+            else:
+                src_port = args.src_port + i
+
+            if args._dst_port_list:
+                dst_port = args._dst_port_list[i % len(args._dst_port_list)]
+            else:
+                dst_port = args.dst_port
+
             scapy_pkt, payload_off = build_qinq_packet(
-                args.src_mac, dst_mac_for_port, user_ip, args.dst_ip,
-                args.src_port + i, args.dst_port,
-                s_vlan, c_vlan, requested_size,
+                args.src_mac, dst_mac_for_port, user_ip, dst_ip,
+                src_port, dst_port,
+                s_vlan, c_vlan, pkt_size,
                 outer_tpid=args.outer_tpid,
-                stamp_head_bytes=args.stamp_head_bytes,
-                l4_proto=args.l4_proto,
-                tcp_flags=args.tcp_flags
+                l4_proto=proto,
+                tcp_flags=tcp_flag,
+                stamp_head_bytes=args._stamp_head_bytes
             )
 
             if pcap_path and first_port_sample:
-                scapy_sample.append(scapy_pkt)
+                scapy_sample.append(scapy_pkt.copy())
 
-            # Field-Engine program: payload stamp + checksum fix
-            vm = build_vm_program(
-                payload_off=payload_off,
-                l4_proto=args.l4_proto,
-                stamp_head_bytes=args.stamp_head_bytes,
-                fix_checksums=bool(args.fix_checksums),
-            )
-
+            vm = build_vm_program(payload_off,
+                                  l4_proto=proto,
+                                  stamp_head_bytes=args._stamp_head_bytes,
+                                  fix_checksums=args.fix_checksums)
             pkt_builder = STLPktBuilder(pkt=scapy_pkt, vm=vm)
             streams.append(STLStream(packet=pkt_builder, mode=STLTXCont(pps=args.pps_per_stream)))
 

@@ -1,49 +1,46 @@
 {
   "trex_server": "127.0.0.1",
-
   "src_mac": "bc:d0:74:59:9b:9e",
   "dst_mac": "00:e0:4c:77:8d:e0",
   "src_ip_base": "192.168.0.",
   "dst_ip": "20.0.0.1",
   "src_port": 1234,
   "dst_port": 443,
-
   "min_size": 64,
   "max_size": 1500,
-  "num_streams": 2,
-  "pps_per_stream": 5,
-
-  "ports": [0],
+  "num_streams": 5000,
+  "pps_per_stream": 10,
+  "ports": [
+    0
+  ],
   "tx_mode": "same_port",
   "rx_mode": "off",
-
-  "s_vlan_start": 100,
-  "s_vlan_count": 10,
-  "c_vlan_start": 200,
-  "c_vlan_count": 20,
-
+  "s_vlan_start": 10,
+  "s_vlan_count": 2000,
+  "c_vlan_start": 5,
+  "c_vlan_count": 2000,
   "outer_tpid": "0x8100",
-
   "duration": 3000,
   "csv_out": "qinq_stats.csv",
   "pcap_out": "qinq_sample.pcap",
-
   "capture_rx": false,
   "capture_file": "/home/kim/qinq_rx_capture.pcap",
   "capture_limit": 2000,
   "capture_bpf": "",
-
   "auto_peer_mac": false,
-
   "fix_checksums": true,
-  "l4_proto": "udp",
-
+  "tcp_flags": "S,PA",
+  "l4_protos": "udp,tcp",
   "auto_profile": true,
   "start_load": "10gbps",
   "max_load": "10gbps",
   "profile_pattern": "hold",
   "pattern_ratios": "0",
   "ramp_steps": 1,
-
-  "load_profile": null
+  "load_profile": null,
+  "src_ip_range": "192.168.0.1-192.168.100.1",
+  "dst_ip_list": "20.0.0.1,20.100.0.2",
+  "dst_ip_range": "",
+  "src_port_range": "1200-1250",
+  "dst_port_range": "4000-4010"
 }
