@@ -15,7 +15,7 @@ if TREX_API_PATH not in sys.path:
     sys.path.insert(0, TREX_API_PATH)
 
 from trex_stl_lib.api import (
-    STLClient, STLStream, STLPktBuilder, STLTXCont,
+    STLClient, STLStream, STLPktBuilder, STLTXCont, STLTXMultiBurst,
     STLScVmRaw, STLVmFixIpv4, STLVmFixChecksumHw, STLVmFlowVar, STLVmWrFlowVar
 )
 from scapy.all import Ether, Dot1Q, IP, UDP, TCP, Raw, wrpcap
@@ -433,6 +433,8 @@ def build_arg_parser():
     p.add_argument("--max_size", type=int, default=1500)
     p.add_argument("--num_streams", type=int, default=300)
     p.add_argument("--pps_per_stream", type=int, default=50)
+    p.add_argument("--dup_factor", type=int, default=2,
+                   help="Number of identical packets transmitted back-to-back per stream (>=1).")
 
     # Ports & modes
     p.add_argument("--ports", type=int, nargs="+", default=[0, 1])
@@ -565,6 +567,8 @@ def parse_args_2stage():
     args._src_port_list = src_ports if src_ports else None
     args._dst_port_list = dst_ports if dst_ports else None
     args._stamp_head_bytes = args.stamp_head_bytes
+    if args.dup_factor < 1:
+        raise ValueError("--dup_factor must be >= 1")
 
     return args
 
@@ -574,6 +578,7 @@ def parse_args_2stage():
 # ---------------------------------------------------------
 def main():
     args = parse_args_2stage()
+    dup_factor = max(1, args.dup_factor)
 
     client = STLClient(server=args.trex_server)
     client.connect()
@@ -629,6 +634,7 @@ def main():
             else:
                 dst_port = args.dst_port
 
+            stamp_head_bytes = args._stamp_head_bytes if dup_factor == 1 else 0
             scapy_pkt, payload_off = build_qinq_packet(
                 args.src_mac, dst_mac_for_port, user_ip, dst_ip,
                 src_port, dst_port,
@@ -636,7 +642,7 @@ def main():
                 outer_tpid=args.outer_tpid,
                 l4_proto=proto,
                 tcp_flags=tcp_flag,
-                stamp_head_bytes=args._stamp_head_bytes
+                stamp_head_bytes=stamp_head_bytes
             )
 
             if pcap_path and first_port_sample:
@@ -644,13 +650,26 @@ def main():
 
             vm = build_vm_program(payload_off,
                                   l4_proto=proto,
-                                  stamp_head_bytes=args._stamp_head_bytes,
+                                  stamp_head_bytes=stamp_head_bytes,
                                   fix_checksums=args.fix_checksums)
             pkt_builder = STLPktBuilder(pkt=scapy_pkt, vm=vm)
-            streams.append(STLStream(packet=pkt_builder, mode=STLTXCont(pps=args.pps_per_stream)))
+            if dup_factor > 1:
+                mode = STLTXMultiBurst(
+                    pkts_per_burst=dup_factor,
+                    ibg=0.0,
+                    count=0,
+                    isg=0.0,
+                    pps=args.pps_per_stream
+                )
+            else:
+                mode = STLTXCont(pps=args.pps_per_stream)
+            streams.append(STLStream(packet=pkt_builder, mode=mode))
 
         client.add_streams(streams, ports=[txp])
         first_port_sample = False
+
+    if dup_factor > 1:
+        print(f"[dup] Burst mode enabled: each stream transmits {dup_factor} identical packets")
 
     # Save a small sample PCAP of generated packets (from first TX port)
     if pcap_path and scapy_sample:
