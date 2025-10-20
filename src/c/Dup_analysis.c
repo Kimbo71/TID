@@ -98,18 +98,24 @@ static uint16_t ethertype_from_l2(const uint8_t* buf, uint32_t len) {
   return type;
 }
 
-static int packet_is_duplicate(NtNetBuf_t nb, unsigned descriptor_type, int dup_bit) {
+static int packet_is_duplicate(NtNetBuf_t nb, int dup_bit) {
   if (dup_bit < 0) return 0;
-  uint64_t color_bits = 0;
-  if (descriptor_type == 4) {
-    const struct NtDyn4Descr_s* d4 = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb);
-    color_bits = ((uint64_t)d4->color1 << 8) | (uint64_t)d4->color0;
-  } else if (descriptor_type == NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC || descriptor_type == 3) {
-    const struct NtDyn3Descr_s* d3 = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb);
-    color_bits = (((uint64_t)d3->color_hi) << 14) | (uint64_t)d3->color_lo;
-  } else {
+  unsigned dtp = NT_NET_GET_PKT_DESCRIPTOR_TYPE(nb);
+  if (dtp != NT_PACKET_DESCRIPTOR_TYPE_DYNAMIC && dtp != 3 && dtp != 4) {
+    // Unsupported descriptor
     return 0;
   }
+
+  const struct NtDyn3Descr_s* dyn = _NT_NET_GET_PKT_DESCR_PTR_DYN3(nb);
+  uint8_t fmt = dyn->descrFormat;
+  uint64_t color_bits = 0;
+  if (fmt == NT_DYNAMIC_DESCRIPTOR_FORMAT_4) {
+    const struct NtDyn4Descr_s* d4 = _NT_NET_GET_PKT_DESCR_PTR_DYN4(nb);
+    color_bits = ((uint64_t)d4->color1 << 8) | (uint64_t)d4->color0;
+  } else {
+    color_bits = (((uint64_t)dyn->color_hi) << 14) | (uint64_t)dyn->color_lo;
+  }
+
   return (int)((color_bits >> dup_bit) & 0x1ULL);
 }
 
@@ -142,6 +148,9 @@ typedef struct sample_ctx_s {
   char cur1[512];
   uint64_t roll_max_bytes;
   int dup_port;
+  uint64_t cap_ipv4;
+  uint64_t cap_ipv6;
+  uint64_t cap_other;
   uint64_t dup_ipv4;
   uint64_t dup_ipv6;
   uint64_t dup_other;
@@ -260,7 +269,13 @@ static void* capture_thread(void* arg){
 
     int on_dup_port = ((int)rxp == C->dup_port);
     uint16_t ethertype = ethertype_from_l2(l2, cap);
-    int is_dup = on_dup_port && packet_is_duplicate(nb, dtp, C->dup_bit);
+    int is_dup = on_dup_port && packet_is_duplicate(nb, C->dup_bit);
+
+    if (on_dup_port) {
+      if (ethertype == 0x0800) C->cap_ipv4++;
+      else if (ethertype == 0x86DD) C->cap_ipv6++;
+      else C->cap_other++;
+    }
 
     if (is_dup) {
       if (ethertype == 0x0800) C->dup_ipv4++;
@@ -595,13 +610,13 @@ int main(int argc, char** argv) {
     if (v0_pkts > 0) pct_duplicates = ((double)dup_pkts / (double)v0_pkts) * 100.0;
     printf("%-18s | %8.3f %%        |\n", "Duplicates %", pct_duplicates);
 
-    uint64_t dup_captured_total = SC.dup_ipv4 + SC.dup_ipv6 + SC.dup_other;
-    double dup_ipv4_pct = dup_captured_total ? ((double)SC.dup_ipv4 * 100.0 / (double)dup_captured_total) : 0.0;
-    double dup_ipv6_pct = dup_captured_total ? ((double)SC.dup_ipv6 * 100.0 / (double)dup_captured_total) : 0.0;
-    double dup_other_pct = dup_captured_total ? ((double)SC.dup_other * 100.0 / (double)dup_captured_total) : 0.0;
-    print_single_row_pct("IPv4 packets", SC.dup_ipv4, dup_ipv4_pct);
-    print_single_row_pct("IPv6 packets", SC.dup_ipv6, dup_ipv6_pct);
-    print_single_row_pct("Unknown packets", SC.dup_other, dup_other_pct);
+    uint64_t cap_total = SC.cap_ipv4 + SC.cap_ipv6 + SC.cap_other;
+    double cap_ipv4_pct = cap_total ? ((double)SC.cap_ipv4 * 100.0 / (double)cap_total) : 0.0;
+    double cap_ipv6_pct = cap_total ? ((double)SC.cap_ipv6 * 100.0 / (double)cap_total) : 0.0;
+    double cap_other_pct = cap_total ? ((double)SC.cap_other * 100.0 / (double)cap_total) : 0.0;
+    print_single_row_pct("IPv4 packets", SC.cap_ipv4, cap_ipv4_pct);
+    print_single_row_pct("IPv6 packets", SC.cap_ipv6, cap_ipv6_pct);
+    print_single_row_pct("Unknown packets", SC.cap_other, cap_other_pct);
 
     printf("\nExtended Counters\n\n");
     printf("------------------+----------------------+----------------------\n");
