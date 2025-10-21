@@ -1,12 +1,12 @@
 /**
- * Duplicate Analysis Monitor (Dup_analysis.c)
+ * Duplicate Analysis Monitor (dup_analysis.c)
  *
  * Build:
- *   gcc -O2 -g -pthread src/c/Dup_analysis.c \
+ *   gcc -O2 -g -pthread src/c/dup_analysis.c \
  *       -I/opt/napatech3/include \
  *       -L/opt/napatech3/lib \
  *       -lpcap -lntapi \
- *       -o bin/Dup_analysis
+ *       -o bin/dup_analysis
  *
  * The binary expects the Napatech capture libraries to be available in the
  * include/library paths above. Adjust paths if your SDK is installed elsewhere.
