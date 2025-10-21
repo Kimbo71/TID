@@ -433,7 +433,7 @@ def build_arg_parser():
     p.add_argument("--max_size", type=int, default=1500)
     p.add_argument("--num_streams", type=int, default=300)
     p.add_argument("--pps_per_stream", type=int, default=50)
-    p.add_argument("--dup_factor", type=int, default=2,
+    p.add_argument("--dup_factor", type=int, default=1,
                    help="Number of identical packets transmitted back-to-back per stream (>=1).")
     p.add_argument("--duplicate_test", action="store_true",
                    help="Force a single stream that emits duplicate packets from one source IP for testing.")

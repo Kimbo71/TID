@@ -126,8 +126,10 @@ typedef struct sample_ctx_s {
   int pcap_is_nano;
   pcap_dumper_t* d0;
   pcap_dumper_t* d1;
+  pcap_dumper_t* d_orig;
   const char* path0;
   const char* path1;
+  const char* path_orig;
   const char* dir0;
   const char* dir1;
   uint32_t snaplen;
@@ -154,9 +156,13 @@ typedef struct sample_ctx_s {
   uint64_t dup_ipv4;
   uint64_t dup_ipv6;
   uint64_t dup_other;
+  uint64_t orig_ipv4;
+  uint64_t orig_ipv6;
+  uint64_t orig_other;
   int dup_bit;
   uint64_t roll_file_limit;
   uint64_t roll_file_bytes;
+  uint64_t ts_debug_remaining;
 } sample_ctx_t;
 
 static void warn_nt(const char* where, int status);
@@ -281,6 +287,18 @@ static void* capture_thread(void* arg){
       if (ethertype == 0x0800) C->dup_ipv4++;
       else if (ethertype == 0x86DD) C->dup_ipv6++;
       else C->dup_other++;
+    } else if (on_dup_port) {
+      if (ethertype == 0x0800) C->orig_ipv4++;
+      else if (ethertype == 0x86DD) C->orig_ipv6++;
+      else C->orig_other++;
+    }
+
+    if (C->ts_debug_remaining > 0 && on_dup_port) {
+      printf("[ts-debug] ts=%" PRIu64 " dup=%d eth=0x%04x\n",
+             ts_ns,
+             is_dup,
+             ethertype);
+      C->ts_debug_remaining--;
     }
 
     if (C->d0 && is_dup) {
@@ -298,6 +316,10 @@ static void* capture_thread(void* arg){
           if (pos >= 0) C->roll_file_bytes = (uint64_t)pos;
         }
       }
+    }
+
+    if (C->d_orig && on_dup_port && !is_dup) {
+      pcap_dump((u_char*)C->d_orig, &h, l2);
     }
 
     if (C->rolling) {
@@ -350,6 +372,7 @@ int main(int argc, char** argv) {
   // Sampling options
   const char* pcap0_path = NULL;
   const char* pcap1_path = NULL;
+  const char* pcap_orig_path = NULL;
   const char* pcap0_dir  = "/dev/shm";  // default rolling dirs
   const char* pcap1_dir  = "/dev/shm";
   uint32_t snaplen = 0;           // 0 = full captured packet
@@ -368,6 +391,7 @@ int main(int argc, char** argv) {
   // NTPL apply (inline). Modes: 0=none, 1=dedup duplicate+mark, 2=dedup drop
   int ntpl_mode = 0;              // default: do NOT apply NTPL automatically
   int ntpl_clear = 0;             // optionally clear rules first
+  uint64_t ts_debug_count = 0;
 
   static struct option long_opts[] = {
     {"adapter",   required_argument, NULL, 'a'},
@@ -375,6 +399,7 @@ int main(int argc, char** argv) {
     {"once",      no_argument,       NULL, 'o'},
     {"pcap0",     required_argument, NULL, 1001},
     {"pcap1",     required_argument, NULL, 1002},
+    {"pcap-original", required_argument, NULL, 1100},
     {"pcap0-dir", required_argument, NULL, 1011},
     {"pcap1-dir", required_argument, NULL, 1012},
     {"snaplen",   required_argument, NULL, 1003},
@@ -394,6 +419,7 @@ int main(int argc, char** argv) {
     {"roll-max-mib", required_argument, NULL, 1024},
     {"roll-file-mib", required_argument, NULL, 1025},
     {"dup-bit", required_argument, NULL, 1026},
+    {"ts-debug", required_argument, NULL, 1101},
     {NULL, 0, NULL, 0}
   };
   int opt;
@@ -404,6 +430,7 @@ int main(int argc, char** argv) {
       case 'o': once = 1; break;
       case 1001: pcap0_path = optarg; break;
       case 1002: pcap1_path = optarg; break;
+      case 1100: pcap_orig_path = optarg; break;
       case 1011: pcap0_dir = optarg; break;
       case 1012: pcap1_dir = optarg; break;
       case 1003: snaplen = (uint32_t)atoi(optarg); if ((int)snaplen < 0) snaplen = 0; break;
@@ -423,13 +450,15 @@ int main(int argc, char** argv) {
       case 1024: { long long mib = atoll(optarg); if (mib < 0) mib = 0; roll_max_bytes = (uint64_t)mib * 1024ULL * 1024ULL; } break;
       case 1025: { long long mib = atoll(optarg); if (mib < 0) mib = 0; roll_file_mib = mib; } break;
       case 1026: dup_bit = atoi(optarg); if (dup_bit < 0) dup_bit = 0; if (dup_bit > 63) dup_bit = 63; break;
+      case 1101: { long long n = atoll(optarg); if (n < 0) n = 0; ts_debug_count = (uint64_t)n; } break;
       default:
         fprintf(stderr, "Usage: %s [--adapter=N] [--interval=SEC] [--once]\n"
                         "            [--pcap0=PATH] [--pcap1=PATH] [--pcap0-dir=DIR] [--pcap1-dir=DIR]\n"
                         "            [--snaplen=B(0=full)] [--sample-count=N] [--sample-seconds=S]\n"
                         "            [--rx-stream-id=N] [--port0=N] [--port1=N] (defaults: port0=0, port1=1)\n"
                         "            [--ntpl-duplicate|--ntpl-drop|--no-ntpl] [--ntpl-clear]\n"
-                        "            [--roll-file-mib=N] [--dup-bit=N]\n", argv[0]);
+                        "            [--pcap-original=PATH] [--roll-file-mib=N] [--dup-bit=N]\n"
+                        "            [--ts-debug=N]\n", argv[0]);
         return EXIT_FAILURE;
     }
   }
@@ -480,16 +509,17 @@ int main(int argc, char** argv) {
   sample_ctx_t SC = {0};
   pthread_t cap_thread;
   int capture_thread_started = 0;
-  int open_dumpers = rolling || pcap0_path;
+  int open_dumpers = rolling || pcap0_path || pcap1_path || pcap_orig_path;
 
   {
     SC.running = 1; SC.snaplen = snaplen; SC.target = sample_count; SC.max_sec = sample_seconds;
-    SC.path0 = pcap0_path; SC.path1 = pcap1_path; SC.dir0 = pcap0_dir; SC.dir1 = pcap1_dir; SC.port0 = port0_index; SC.port1 = port1_index;
+    SC.path0 = pcap0_path; SC.path1 = pcap1_path; SC.path_orig = pcap_orig_path; SC.dir0 = pcap0_dir; SC.dir1 = pcap1_dir; SC.port0 = port0_index; SC.port1 = port1_index;
     SC.rolling = rolling; SC.roll_count = roll_count; SC.roll_seconds = roll_seconds; SC.roll_max_bytes = roll_max_bytes;
     SC.dup_port = port0_index;
     SC.dup_bit = dup_bit;
     SC.roll_file_limit = roll_file_limit;
     SC.roll_file_bytes = 0;
+    SC.ts_debug_remaining = ts_debug_count;
     clock_gettime(CLOCK_REALTIME, &SC.t0);
     if (open_dumpers) {
       /* Prefer nanosecond precision PCAP if libpcap supports it */
@@ -545,6 +575,18 @@ int main(int argc, char** argv) {
           }
         }
         SC.d1 = NULL;
+      }
+      if (SC.path_orig) {
+        SC.d_orig = pcap_dump_open(SC.p_dead, SC.path_orig);
+        if (!SC.d_orig) {
+          fprintf(stderr, "pcap_dump_open %s: %s\n", SC.path_orig, pcap_geterr(SC.p_dead));
+        } else {
+          FILE* nf = (FILE*)pcap_dump_file(SC.d_orig);
+          if (nf) {
+            int fd = fileno(nf);
+            if (fd >= 0) fchmod(fd, 0644);
+          }
+        }
       }
     }
     // Open a capture RX stream (always open for 'seen' and stats, even if not writing PCAP)
@@ -634,6 +676,12 @@ int main(int argc, char** argv) {
       print_side_row("No VLAN/MPLS", 0, 0);
       print_side_row("VLAN", 0, 0);
       print_side_row("VLAN/MPLS", 0, 0);
+      print_side_row("Original IPv4", SC.orig_ipv4, 0);
+      print_side_row("Original IPv6", SC.orig_ipv6, 0);
+      print_side_row("Original other", SC.orig_other, 0);
+      print_side_row("Duplicate IPv4", SC.dup_ipv4, 0);
+      print_side_row("Duplicate IPv6", SC.dup_ipv6, 0);
+      print_side_row("Duplicate other", SC.dup_other, 0);
     }
 
     // Stage-2 removes Drop counters, Dedup summary table, and adapter color totals
@@ -677,6 +725,7 @@ int main(int argc, char** argv) {
   if (SC.rx) NT_NetRxClose(SC.rx);
   if (SC.d0) { pcap_dump_close(SC.d0); }
   if (SC.d1) { pcap_dump_close(SC.d1); }
+  if (SC.d_orig) { pcap_dump_close(SC.d_orig); }
   if (SC.p_dead) { pcap_close(SC.p_dead); }
   NT_Done();
   return 0;

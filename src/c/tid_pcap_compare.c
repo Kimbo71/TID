@@ -61,23 +61,23 @@ static uint64_t fnv1a64(const uint8_t* data, size_t len){
 typedef struct {
   uint64_t* digests;
   uint32_t* lens;
-  uint64_t* ts_us;   // packet header timestamp (microseconds)
+  uint64_t* ts_ns;   // packet header timestamp (nanoseconds)
   size_t cap;
   size_t used;
 } digest_vec_t;
 
-static void dv_init(digest_vec_t* v){ v->digests=NULL; v->lens=NULL; v->ts_us=NULL; v->cap=0; v->used=0; }
+static void dv_init(digest_vec_t* v){ v->digests=NULL; v->lens=NULL; v->ts_ns=NULL; v->cap=0; v->used=0; }
 static void dv_reserve(digest_vec_t* v, size_t need){
   if (need <= v->cap) return;
   size_t nc = v->cap ? v->cap*2 : 1024; while (nc < need) nc*=2;
   v->digests = (uint64_t*)realloc(v->digests, nc*sizeof(uint64_t));
   v->lens    = (uint32_t*)realloc(v->lens,    nc*sizeof(uint32_t));
-  v->ts_us   = (uint64_t*)realloc(v->ts_us,   nc*sizeof(uint64_t));
-  if (!v->digests || !v->lens || !v->ts_us){ fprintf(stderr, "alloc failed\n"); exit(1);} v->cap = nc;
+  v->ts_ns   = (uint64_t*)realloc(v->ts_ns,   nc*sizeof(uint64_t));
+  if (!v->digests || !v->lens || !v->ts_ns){ fprintf(stderr, "alloc failed\n"); exit(1);} v->cap = nc;
 }
-static void dv_push(digest_vec_t* v, uint64_t d, uint32_t l, uint64_t ts){ dv_reserve(v, v->used+1); v->digests[v->used]=d; v->lens[v->used]=l; v->ts_us[v->used]=ts; v->used++; }
+static void dv_push(digest_vec_t* v, uint64_t d, uint32_t l, uint64_t ts){ dv_reserve(v, v->used+1); v->digests[v->used]=d; v->lens[v->used]=l; v->ts_ns[v->used]=ts; v->used++; }
 static void dv_reset(digest_vec_t* v){ v->used=0; }
-static void dv_free(digest_vec_t* v){ free(v->digests); free(v->lens); free(v->ts_us); dv_init(v);} 
+static void dv_free(digest_vec_t* v){ free(v->digests); free(v->lens); free(v->ts_ns); dv_init(v);} 
 
 typedef struct {
   const char* path0;
@@ -86,7 +86,7 @@ typedef struct {
   const char* dir1;
   double interval;
   size_t max_pairs;   // 0 = all available
-  uint64_t window_us;
+  uint64_t window_ns;
   // report options
   const char* report_path;
   size_t report_limit;   // number of mismatches to include
@@ -120,10 +120,15 @@ static size_t load_pcaps(const char* path, digest_vec_t* out){
   pcap_t* p = pcap_open_offline(path, errbuf);
   if (!p) return 0;
   const u_char* data; struct pcap_pkthdr* hdr; int rc;
+  int precision = pcap_get_tstamp_precision(p);
   while ((rc = pcap_next_ex(p, &hdr, &data)) == 1){
     uint32_t l = hdr->caplen;
     uint64_t d = fnv1a64((const uint8_t*)data, l);
-    uint64_t ts = (uint64_t)hdr->ts.tv_sec * 1000000ULL + (uint64_t)hdr->ts.tv_usec;
+    uint64_t ts;
+    if (precision == PCAP_TSTAMP_PRECISION_NANO)
+      ts = (uint64_t)hdr->ts.tv_sec * 1000000000ULL + (uint64_t)hdr->ts.tv_usec;
+    else
+      ts = (uint64_t)hdr->ts.tv_sec * 1000000ULL + (uint64_t)hdr->ts.tv_usec;
     dv_push(out, d, l, ts);
   }
   pcap_close(p);
@@ -131,13 +136,13 @@ static size_t load_pcaps(const char* path, digest_vec_t* out){
 }
 
 static size_t dv_lower_bound_ts(const digest_vec_t* v, uint64_t target){
-  size_t lo=0, hi=v->used; while (lo<hi){ size_t mid=(lo+hi)/2; if (v->ts_us[mid] < target) lo=mid+1; else hi=mid; } return lo;
+  size_t lo=0, hi=v->used; while (lo<hi){ size_t mid=(lo+hi)/2; if (v->ts_ns[mid] < target) lo=mid+1; else hi=mid; } return lo;
 }
 
 static void auto_offsets_by_ts(const digest_vec_t* v0, const digest_vec_t* v1, size_t* off0, size_t* off1){
   size_t o0=0,o1=0; if (v0->used==0 || v1->used==0){ *off0=o0; *off1=o1; return; }
-  uint64_t t0=v0->ts_us[0]; size_t j=dv_lower_bound_ts(v1,t0); size_t bj=j; if (j>0){ uint64_t d1 = (j<v1->used)? (v1->ts_us[j]>t0? v1->ts_us[j]-t0 : t0-v1->ts_us[j]) : UINT64_MAX; uint64_t d0 = (v1->ts_us[j-1]>t0? v1->ts_us[j-1]-t0 : t0-v1->ts_us[j-1]); if (j>=v1->used || d0<=d1) bj=j-1; }
-  uint64_t t1=v1->ts_us[0]; size_t i=dv_lower_bound_ts(v0,t1); size_t bi=i; if (i>0){ uint64_t d1=(i<v0->used)? (v0->ts_us[i]>t1? v0->ts_us[i]-t1 : t1-v0->ts_us[i]) : UINT64_MAX; uint64_t d0=(v0->ts_us[i-1]>t1? v0->ts_us[i-1]-t1 : t1-v0->ts_us[i-1]); if (i>=v0->used || d0<=d1) bi=i-1; }
+  uint64_t t0=v0->ts_ns[0]; size_t j=dv_lower_bound_ts(v1,t0); size_t bj=j; if (j>0){ uint64_t d1 = (j<v1->used)? (v1->ts_ns[j]>t0? v1->ts_ns[j]-t0 : t0-v1->ts_ns[j]) : UINT64_MAX; uint64_t d0 = (v1->ts_ns[j-1]>t0? v1->ts_ns[j-1]-t0 : t0-v1->ts_ns[j-1]); if (j>=v1->used || d0<=d1) bj=j-1; }
+  uint64_t t1=v1->ts_ns[0]; size_t i=dv_lower_bound_ts(v0,t1); size_t bi=i; if (i>0){ uint64_t d1=(i<v0->used)? (v0->ts_ns[i]>t1? v0->ts_ns[i]-t1 : t1-v0->ts_ns[i]) : UINT64_MAX; uint64_t d0=(v0->ts_ns[i-1]>t1? v0->ts_ns[i-1]-t1 : t1-v0->ts_ns[i-1]); if (i>=v0->used || d0<=d1) bi=i-1; }
   size_t cand_o0[2]={0,bi}; size_t cand_o1[2]={bj,0}; int best=0; size_t best_mm=SIZE_MAX;
   for(int k=0;k<2;k++){
     size_t a=cand_o0[k], b=cand_o1[k]; size_t n0=v0->used>a?(v0->used-a):0; size_t n1=v1->used>b?(v1->used-b):0; size_t pairs = n0<n1?n0:n1; if (!pairs) continue; if (pairs>64) pairs=64; size_t mm=0; for(size_t x=0;x<pairs;x++){ size_t i0=a+x, i1=b+x; if (v0->lens[i0]!=v1->lens[i1] || v0->digests[i0]!=v1->digests[i1]) mm++; } if (mm<best_mm){ best_mm=mm; best=k; }
@@ -202,7 +207,7 @@ static compare_result_t compare_windowed(const digest_vec_t* v0,
                                          size_t off0,
                                          size_t off1,
                                          size_t max_pairs,
-                                         uint64_t window_us,
+                                         uint64_t window_ns,
                                          index_vec_t* mis,
                                          size_t mis_limit){
   compare_result_t res;
@@ -223,14 +228,14 @@ static compare_result_t compare_windowed(const digest_vec_t* v0,
 
   for (size_t i = 0; i < pairs; ++i){
     size_t idx0 = off0 + i;
-    uint64_t ts0 = v0->ts_us[idx0];
+    uint64_t ts0 = v0->ts_ns[idx0];
     size_t best = (size_t)-1;
     for (size_t j = 0; j < pairs; ++j){
       if (matched[j]) continue;
       size_t idx1 = off1 + j;
-      uint64_t ts1 = v1->ts_us[idx1];
+      uint64_t ts1 = v1->ts_ns[idx1];
       uint64_t diff_ts = (ts0 > ts1) ? (ts0 - ts1) : (ts1 - ts0);
-      if (diff_ts > window_us) continue;
+      if (window_ns && diff_ts > window_ns) continue;
       if (v0->lens[idx0] == v1->lens[idx1] && v0->digests[idx0] == v1->digests[idx1]){
         best = j;
         break;
@@ -258,7 +263,7 @@ int main(int argc, char** argv){
   const char* auto_report_dir = NULL; size_t auto_report_limit = 20; size_t auto_report_bytes = 64;
   int alt_screen = 0;
   size_t offset0 = 0, offset1 = 0; int auto_offset_ts = 0;
-  uint64_t window_us = 0;
+  uint64_t window_ns = 0;
   static struct option opts[] = {
     {"pcap0", required_argument, NULL, 1001},
     {"pcap1", required_argument, NULL, 1002},
@@ -295,7 +300,13 @@ int main(int argc, char** argv){
       case 1016: { long long x = atoll(optarg); if (x<0) x=0; auto_report_limit=(size_t)x; } break;
       case 1017: { long long x = atoll(optarg); if (x<0) x=0; auto_report_bytes=(size_t)x; if (!auto_report_bytes) auto_report_bytes=1; } break;
       case 1018: alt_screen = 1; break;
-      case 1019: { long long x = atoll(optarg); if (x < 0) x = 0; window_us = (uint64_t)x; } break;
+      case 1019: {
+        long long x = atoll(optarg);
+        if (x < 0) x = 0;
+        uint64_t ux = (uint64_t)x;
+        if (ux > UINT64_MAX / 1000ULL) window_ns = UINT64_MAX;
+        else window_ns = ux * 1000ULL;
+      } break;
       case 'i': interval = atof(optarg); if (interval<=0.0) interval=0.5; break;
       case 'o': once = 1; break;
       case 1003: max_pairs = (size_t)atol(optarg); break;
@@ -323,7 +334,15 @@ int main(int argc, char** argv){
   signal(SIGINT, on_sigint);
   if (alt_screen) { fputs("\033[?1049h", stdout); fflush(stdout); }
 
-  compare_ctx_t C = {0}; C.path0 = p0; C.path1 = p1; C.dir0 = dir0; C.dir1 = dir1; C.follow_latest = follow_latest; C.interval = interval; C.max_pairs = max_pairs; C.window_us = window_us;
+  compare_ctx_t C = (compare_ctx_t){0};
+  C.path0 = p0;
+  C.path1 = p1;
+  C.dir0 = dir0;
+  C.dir1 = dir1;
+  C.follow_latest = follow_latest;
+  C.interval = interval;
+  C.max_pairs = max_pairs;
+  C.window_ns = window_ns;
   C.report_path = report_path; C.report_limit = report_limit; C.report_bytes = report_bytes;
   dv_init(&C.v0); dv_init(&C.v1);
   index_vec_t mis; iv_init(&mis);
@@ -349,7 +368,7 @@ int main(int argc, char** argv){
             load_pcaps(e0[i0].path,&dv0); load_pcaps(e1[i1].path,&dv1);
             size_t off0=offset0, off1=offset1; if (auto_offset_ts){ auto_offsets_by_ts(&dv0,&dv1,&off0,&off1);}
             index_vec_t mis_local; iv_init(&mis_local);
-            compare_result_t cr = compare_windowed(&dv0, &dv1, off0, off1, max_pairs, window_us, &mis_local, auto_report_limit);
+            compare_result_t cr = compare_windowed(&dv0, &dv1, off0, off1, max_pairs, window_ns, &mis_local, auto_report_limit);
             uint64_t cdiffs = cr.diffs;
             size_t cpairs = cr.pairs;
             sum_diffs += cdiffs; files_compared++;
@@ -380,7 +399,7 @@ int main(int argc, char** argv){
     size_t off0 = offset0, off1 = offset1;
     if (auto_offset_ts){ auto_offsets_by_ts(&C.v0, &C.v1, &off0, &off1); }
     iv_reset(&mis);
-    compare_result_t res = compare_windowed(&C.v0, &C.v1, off0, off1, C.max_pairs, C.window_us, &mis, C.report_limit);
+    compare_result_t res = compare_windowed(&C.v0, &C.v1, off0, off1, C.max_pairs, C.window_ns, &mis, C.report_limit);
     size_t pairs = res.pairs;
     uint64_t diffs = res.diffs;
     size_t first_i = res.first_mismatch;
